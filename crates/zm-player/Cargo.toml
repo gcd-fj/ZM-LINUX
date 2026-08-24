@@ -1,0 +1,22 @@
+[package]
+name = "zm-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+async-task.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+fontdb.workspace = true
+ruffle-core.workspace = true
+ruffle-frontend-utils.workspace = true
+ruffle-render-wgpu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+webbrowser.workspace = true
+wgpu.workspace = true
+zm-core = { path = "../zm-core" }

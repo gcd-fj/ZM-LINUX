@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ZM-LINUX
+Comment=造梦西游 Linux 原生客户端
+Exec=zm-linux
+Icon=io.github.gcd-fj.zm-linux
+Categories=Game;
+Keywords=造梦西游;西游;Linux;
+StartupWMClass=io.github.gcd-fj.zm-linux
+Terminal=false

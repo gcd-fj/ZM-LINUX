@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gcd-fj.zm-linux</id>
+  <name>ZM-LINUX</name>
+  <summary>造梦西游 Linux 原生客户端</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.gcd-fj"><name>gcd-fj</name></developer>
+  <description>
+    <p>使用 Rust、egui 和固定版本的原生 Ruffle 运行《造梦西游4》与《造梦西游5》。提供 4399
+      登录、验证码、资源发现、安全缓存和多账号管理。
+    </p>
+    <p>优先支持 Wayland，并在不可用时兼容 X11；无需 Wine、Adobe AIR、Electron 或浏览器外壳。</p>
+  </description>
+  <launchable type="desktop-id">io.github.gcd-fj.zm-linux.desktop</launchable>
+  <provides><binary>zm-linux</binary></provides>
+  <content_rating type="oars-1.1"/>
+</component>

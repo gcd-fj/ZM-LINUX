@@ -1,0 +1,11 @@
+/target
+/.runtime
+/dist
+/logs
+/.idea
+/.vscode
+*.AppImage
+*.AppImage.sha256
+/assets/bridge/ZmLinuxHost.abc
+/assets/bridge/ZmLinuxHost.swf
+/assets/bridge/stubs/*.abc

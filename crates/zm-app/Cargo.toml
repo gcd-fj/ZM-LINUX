@@ -1,0 +1,26 @@
+[package]
+name = "zm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zm-linux"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+image.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+zm-assets = { path = "../zm-assets" }
+zm-auth = { path = "../zm-auth" }
+zm-core = { path = "../zm-core" }
+zm-player = { path = "../zm-player" }
+
+[dev-dependencies]
+tempfile.workspace = true
