@@ -34,7 +34,7 @@ pub struct AuthSession {
     pub uid: u64,
     pub token: String,
     pub display_name: String,
-    /// Authenticated 4399 cookies kept only for the in-memory game session.
+    /// 已认证的 4399 Cookie，仅保留在当前游戏进程的内存中。
     pub auth_cookie: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,9 +4,12 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Weak},
     time::Duration,
 };
+use tokio::sync::Mutex;
 use zm_core::{GameKind, Result, ZmError};
 
 mod swf_patch;
@@ -30,6 +33,12 @@ pub struct GameAsset {
     pub sha256: String,
     pub cache_hit: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeAsset {
+    pub bytes: Vec<u8>,
+    pub cache_hit: bool,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheScope {
     Game(GameKind),
@@ -40,7 +49,7 @@ pub enum CacheScope {
 pub trait AssetManager: Send + Sync {
     async fn resolve_version(&self, game: GameKind) -> Result<GameVersion>;
     async fn ensure_game(&self, game: GameKind) -> Result<GameAsset>;
-    async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<Vec<u8>>;
+    async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset>;
     async fn clear_cache(&self, scope: CacheScope) -> Result<()>;
 }
 
@@ -48,6 +57,16 @@ pub trait AssetManager: Send + Sync {
 pub struct OfficialAssetManager {
     client: Client,
     cache_root: PathBuf,
+    in_flight: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    resource_roots: Arc<HashMap<GameKind, Url>>,
+    #[cfg(test)]
+    test_responses: Option<Arc<TestResponses>>,
+}
+
+#[cfg(test)]
+struct TestResponses {
+    values: Mutex<std::collections::VecDeque<Result<Vec<u8>>>>,
+    requests: std::sync::atomic::AtomicUsize,
 }
 
 impl OfficialAssetManager {
@@ -60,19 +79,44 @@ impl OfficialAssetManager {
         Ok(Self {
             client,
             cache_root: cache_root.into(),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            resource_roots: Arc::new(Self::default_resource_roots()),
+            #[cfg(test)]
+            test_responses: None,
         })
-    }
-    pub fn cache_root(&self) -> &Path {
-        &self.cache_root
     }
     fn game_dir(&self, game: GameKind) -> PathBuf {
         self.cache_root.join(game.slug())
     }
-    fn resource_root(game: GameKind) -> &'static str {
-        match game {
-            GameKind::Zm4 => "https://sda.4399.com/4399swf/upload_swf/ftp15/csya/20150127/1/",
-            GameKind::Zm5 => "https://sda.4399.com/4399swf/upload_swf/ftp22/csya/20170622/1/",
-        }
+    fn default_resource_roots() -> HashMap<GameKind, Url> {
+        [
+            (
+                GameKind::Zm4,
+                Url::parse("https://sda.4399.com/4399swf/upload_swf/ftp15/csya/20150127/1/")
+                    .unwrap(),
+            ),
+            (
+                GameKind::Zm5,
+                Url::parse("https://sda.4399.com/4399swf/upload_swf/ftp22/csya/20170622/1/")
+                    .unwrap(),
+            ),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[cfg(test)]
+    fn with_test_responses(
+        cache_root: impl Into<PathBuf>,
+        responses: Vec<Result<Vec<u8>>>,
+    ) -> Result<(Self, Arc<TestResponses>)> {
+        let mut manager = Self::new(cache_root)?;
+        let responses = Arc::new(TestResponses {
+            values: Mutex::new(responses.into()),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        });
+        manager.test_responses = Some(responses.clone());
+        Ok((manager, responses))
     }
     fn standalone_url(game: GameKind) -> String {
         format!("{HOME_URL}?g={}", game.number())
@@ -94,6 +138,71 @@ impl OfficialAssetManager {
             .await
             .map_err(|e| ZmError::Network(e.to_string()))?
             .to_vec())
+    }
+
+    async fn get_runtime_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let mut last_error = None;
+        for (attempt, delay_ms) in [0, 250, 750].into_iter().enumerate() {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            match self.get_runtime_bytes_once(url).await {
+                Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+                Ok(_) => last_error = Some("服务器返回了空资源".to_owned()),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            if attempt < 2 {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    resource = %sanitized_resource_url(url),
+                    "运行时资源下载失败，准备重试"
+                );
+            }
+        }
+        Err(ZmError::Network(format!(
+            "运行时资源下载失败：{}",
+            last_error.unwrap_or_else(|| "未知错误".into())
+        )))
+    }
+
+    async fn get_runtime_bytes_once(&self, url: &str) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(responses) = &self.test_responses {
+            responses
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return responses
+                .values
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(ZmError::Network("测试响应已耗尽".into())));
+        }
+        self.get_bytes(url, Some(HOME_URL)).await
+    }
+
+    async fn runtime_resource_dir(&self, game: GameKind) -> PathBuf {
+        let manifest_path = self.game_dir(game).join("manifest.toml");
+        let namespace = tokio::fs::read_to_string(manifest_path)
+            .await
+            .ok()
+            .and_then(|raw| toml::from_str::<Manifest>(&raw).ok())
+            .map(|manifest| {
+                let version_hash = digest(manifest.version.as_bytes());
+                format!("patch{}-{}", manifest.patch_version, &version_hash[..12])
+            })
+            .unwrap_or_else(|| format!("patch{PATCH_VERSION}-unknown"));
+        self.game_dir(game).join("resources").join(namespace)
+    }
+
+    async fn resource_lock(&self, path: &Path) -> Arc<Mutex<()>> {
+        let mut locks = self.in_flight.lock().await;
+        if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(path.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -216,7 +325,7 @@ impl AssetManager for OfficialAssetManager {
         })
     }
 
-    async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<Vec<u8>> {
+    async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset> {
         let resource = resource
             .split('?')
             .next()
@@ -230,17 +339,25 @@ impl AssetManager for OfficialAssetManager {
         {
             return Err(ZmError::Asset("拒绝不安全的资源路径".into()));
         }
-        let local = self.game_dir(game).join("resources").join(path);
+        let local = self.runtime_resource_dir(game).await.join(path);
+        let resource_lock = self.resource_lock(&local).await;
+        let _resource_guard = resource_lock.lock().await;
         if local.exists() {
-            return tokio::fs::read(&local)
+            let bytes = tokio::fs::read(&local)
                 .await
-                .map_err(|e| ZmError::io(&local, e));
+                .map_err(|e| ZmError::io(&local, e))?;
+            return Ok(RuntimeAsset {
+                bytes,
+                cache_hit: true,
+            });
         }
-        let url = Url::parse(Self::resource_root(game))
-            .unwrap()
+        let url = self
+            .resource_roots
+            .get(&game)
+            .ok_or_else(|| ZmError::Asset("缺少游戏资源根地址".into()))?
             .join(resource)
             .map_err(|e| ZmError::Asset(e.to_string()))?;
-        let bytes = self.get_bytes(url.as_str(), Some(HOME_URL)).await?;
+        let bytes = self.get_runtime_bytes(url.as_str()).await?;
         if let Some(parent) = local.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -253,7 +370,10 @@ impl AssetManager for OfficialAssetManager {
         tokio::fs::rename(&temp, &local)
             .await
             .map_err(|e| ZmError::io(&local, e))?;
-        Ok(bytes)
+        Ok(RuntimeAsset {
+            bytes,
+            cache_hit: false,
+        })
     }
 
     async fn clear_cache(&self, scope: CacheScope) -> Result<()> {
@@ -281,9 +401,43 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn sanitized_resource_url(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .map(|url| {
+            format!(
+                "{}://{}{}",
+                url.scheme(),
+                url.host_str().unwrap_or(""),
+                url.path()
+            )
+        })
+        .unwrap_or_else(|| "<无效资源地址>".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    async fn write_manifest(manager: &OfficialAssetManager, game: GameKind, version: &str) {
+        let directory = manager.game_dir(game);
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let manifest = Manifest {
+            version: version.into(),
+            raw_sha256: "raw".into(),
+            bridge_sha256: digest(bridge_abc(game)),
+            final_sha256: "final".into(),
+            patch_version: PATCH_VERSION,
+        };
+        tokio::fs::write(
+            directory.join("manifest.toml"),
+            toml::to_string(&manifest).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn rejects_traversal() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -304,5 +458,90 @@ mod tests {
             digest(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn retries_then_uses_the_atomic_cache() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, responses) = OfficialAssetManager::with_test_responses(
+            directory.path(),
+            vec![
+                Err(ZmError::Network("第一次失败".into())),
+                Err(ZmError::Network("第二次失败".into())),
+                Ok(b"runtime-asset".to_vec()),
+            ],
+        )
+        .unwrap();
+        runtime.block_on(write_manifest(&manager, GameKind::Zm4, "main-v1.swf"));
+
+        let first = runtime
+            .block_on(manager.fetch_resource(GameKind::Zm4, "ui/icon.png"))
+            .unwrap();
+        let second = runtime
+            .block_on(manager.fetch_resource(GameKind::Zm4, "ui/icon.png"))
+            .unwrap();
+        assert_eq!(first.bytes, b"runtime-asset");
+        assert!(!first.cache_hit);
+        assert!(second.cache_hit);
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 3);
+        let cached = runtime
+            .block_on(manager.runtime_resource_dir(GameKind::Zm4))
+            .join("ui/icon.png");
+        assert!(cached.is_file());
+        assert!(!cached.with_extension("part").exists());
+    }
+
+    #[test]
+    fn merges_concurrent_requests_for_the_same_resource() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, responses) = OfficialAssetManager::with_test_responses(
+            directory.path(),
+            vec![Ok(b"one-download".to_vec())],
+        )
+        .unwrap();
+        runtime.block_on(write_manifest(&manager, GameKind::Zm5, "main-v1.swf"));
+
+        let (first, second) = runtime.block_on(async {
+            tokio::join!(
+                manager.fetch_resource(GameKind::Zm5, "module.swf"),
+                manager.fetch_resource(GameKind::Zm5, "module.swf")
+            )
+        });
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.bytes, second.bytes);
+        assert_ne!(first.cache_hit, second.cache_hit);
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manifest_version_and_patch_change_the_resource_namespace() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let manager = OfficialAssetManager::new(directory.path()).unwrap();
+        runtime.block_on(write_manifest(&manager, GameKind::Zm4, "main-v1.swf"));
+        let first = runtime.block_on(manager.runtime_resource_dir(GameKind::Zm4));
+        runtime.block_on(write_manifest(&manager, GameKind::Zm4, "main-v2.swf"));
+        let second = runtime.block_on(manager.runtime_resource_dir(GameKind::Zm4));
+        assert_ne!(first, second);
+
+        let manifest_path = manager.game_dir(GameKind::Zm4).join("manifest.toml");
+        let mut manifest: Manifest = toml::from_str(
+            &runtime
+                .block_on(tokio::fs::read_to_string(&manifest_path))
+                .unwrap(),
+        )
+        .unwrap();
+        manifest.patch_version += 1;
+        runtime
+            .block_on(tokio::fs::write(
+                manifest_path,
+                toml::to_string(&manifest).unwrap(),
+            ))
+            .unwrap();
+        let third = runtime.block_on(manager.runtime_resource_dir(GameKind::Zm4));
+        assert_ne!(second, third);
     }
 }

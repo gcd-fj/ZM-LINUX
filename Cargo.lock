@@ -7330,6 +7330,7 @@ dependencies = [
  "async-task",
  "egui",
  "egui-wgpu",
+ "encoding_rs",
  "fontdb",
  "ruffle_core",
  "ruffle_frontend_utils",
@@ -7339,6 +7340,7 @@ dependencies = [
  "url",
  "webbrowser",
  "wgpu",
+ "zm-assets",
  "zm-core",
 ]
 

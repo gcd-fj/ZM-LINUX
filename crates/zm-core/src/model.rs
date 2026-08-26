@@ -56,10 +56,10 @@ pub struct GameLaunchRequest {
     pub uid: u64,
     pub account_display_name: String,
     pub auth_token: String,
-    /// Authenticated platform cookies for in-memory token refresh only.
+    /// 已认证的平台 Cookie，仅用于当前内存会话刷新游戏令牌。
     pub auth_cookie: String,
     pub cache_root: PathBuf,
     pub main_swf: PathBuf,
-    /// Official URL used as the movie identity while cached bytes are played.
+    /// 播放缓存内容时用作影片身份的官方地址。
     pub movie_url: String,
 }

@@ -10,6 +10,7 @@ async-channel.workspace = true
 async-task.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+encoding_rs.workspace = true
 fontdb.workspace = true
 ruffle-core.workspace = true
 ruffle-frontend-utils.workspace = true
@@ -19,4 +20,5 @@ tracing.workspace = true
 url.workspace = true
 webbrowser.workspace = true
 wgpu.workspace = true
+zm-assets = { path = "../zm-assets" }
 zm-core = { path = "../zm-core" }

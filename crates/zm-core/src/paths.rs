@@ -40,8 +40,8 @@ impl AppPaths {
     }
 }
 
-/// AppImage launchers may temporarily point XDG variables inside the mounted,
-/// read-only AppDir. Never persist user data there; fall back to `$HOME`.
+/// AppImage 启动器可能把 XDG 变量临时指向只读的挂载目录。
+/// 不在该目录持久化用户数据，遇到这种情况统一回退到 `$HOME`。
 fn writable_xdg_dir(variable: &str, home_suffix: &str) -> Option<PathBuf> {
     let app_dir = env::var_os("APPDIR").map(PathBuf::from);
     let configured = env::var_os(variable)

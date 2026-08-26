@@ -5,18 +5,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialAvailability {
-    Available,
-    SessionOnly,
-}
-
 #[async_trait]
 pub trait CredentialStore: Send + Sync {
     async fn save(&self, id: &str, account: &str, password: &str) -> Result<()>;
     async fn load(&self, id: &str, account: &str) -> Result<Option<String>>;
     async fn delete(&self, id: &str, account: &str) -> Result<()>;
-    fn availability(&self) -> CredentialAvailability;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -38,9 +31,6 @@ impl CredentialStore for SessionCredentialStore {
     async fn delete(&self, id: &str, _: &str) -> Result<()> {
         self.values.write().unwrap().remove(id);
         Ok(())
-    }
-    fn availability(&self) -> CredentialAvailability {
-        CredentialAvailability::SessionOnly
     }
 }
 
@@ -71,8 +61,5 @@ impl CredentialStore for SecretServiceStore {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(ZmError::Credential(e.to_string())),
         }
-    }
-    fn availability(&self) -> CredentialAvailability {
-        CredentialAvailability::Available
     }
 }

@@ -6,7 +6,7 @@ use std::{
         Arc,
         mpsc::{self, Receiver, Sender},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
@@ -90,7 +90,10 @@ fn load_icon_texture(ctx: &egui::Context) -> egui::TextureHandle {
 }
 
 fn init_logging(paths: &AppPaths) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // 默认只保留依赖告警和第一方运行信息，避免 Ruffle/WGPU 的逐帧日志刷屏。
+        EnvFilter::new("warn,zm_app=info,zm_auth=info,zm_assets=info,zm_player=info,zm_swf=info")
+    });
     match tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("zm-linux")
@@ -229,6 +232,9 @@ struct ZmApp {
     diagnostics_open: bool,
     account: String,
     password: String,
+    manager_account: String,
+    manager_password: String,
+    manager_save_password: bool,
     captcha_value: String,
     captcha_id: Option<String>,
     captcha_url: Option<String>,
@@ -241,7 +247,6 @@ struct ZmApp {
     save_password: bool,
     busy_step: usize,
     host_ready: bool,
-    last_frame: Instant,
 }
 
 impl ZmApp {
@@ -259,7 +264,12 @@ impl ZmApp {
             .clone()
             .expect("ZM-LINUX需要wgpu渲染后端");
         let (runtime_tx, runtime_rx) = mpsc::channel();
-        let mut player = GameRuntime::new(render_state, cc.egui_ctx.clone(), runtime_tx);
+        let mut player = GameRuntime::new(
+            render_state,
+            cc.egui_ctx.clone(),
+            runtime_tx,
+            assets.clone(),
+        );
         player.set_volume(config.volume);
         let (tx, rx) = mpsc::channel();
         let initial_mode = config
@@ -289,6 +299,9 @@ impl ZmApp {
             diagnostics_open: false,
             account: String::new(),
             password: String::new(),
+            manager_account: String::new(),
+            manager_password: String::new(),
+            manager_save_password: true,
             captcha_value: String::new(),
             captcha_id: None,
             captcha_url: None,
@@ -301,7 +314,6 @@ impl ZmApp {
             save_password: true,
             busy_step: 0,
             host_ready: false,
-            last_frame: Instant::now(),
         };
         app.select_account(initial_mode, cc.egui_ctx.clone());
         app
@@ -523,7 +535,6 @@ impl ZmApp {
                             self.page = Page::Game;
                             self.busy_step = 3;
                             self.host_ready = false;
-                            self.last_frame = Instant::now();
                             self.status = format!("{}已启动", game.display_name());
                         }
                         Err(error) => {
@@ -584,6 +595,10 @@ impl ZmApp {
                 }
                 RuntimeEvent::PaymentBlocked => {
                     self.status = "为保护账号安全，客户端不会直接打开支付页面".into();
+                }
+                RuntimeEvent::ResourceLoaded { .. } => {}
+                RuntimeEvent::ResourceLoadFailed { resource, error } => {
+                    self.status = format!("游戏资源加载失败（{resource}）：{error}");
                 }
                 RuntimeEvent::FatalError(error) => {
                     self.stop_game(format!("注入登录会话失败：{error}"), false);
@@ -764,7 +779,7 @@ impl ZmApp {
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("切换账号").clicked() {
+                            if ui.button("管理用户").clicked() {
                                 self.account_picker_open = true;
                             }
                         });
@@ -878,12 +893,18 @@ impl ZmApp {
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("孙")
-                            .size(22.0)
-                            .strong()
-                            .color(palette::GOLD),
-                    );
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(65, 35, 20))
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("孙")
+                                    .size(22.0)
+                                    .strong()
+                                    .color(palette::GOLD),
+                            );
+                        });
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(&saved.display_name).strong());
                         ui.label(
@@ -891,6 +912,17 @@ impl ZmApp {
                                 .small()
                                 .color(palette::MUTED),
                         );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(48, 173, 139, 28))
+                            .corner_radius(12)
+                            .inner_margin(egui::Margin::symmetric(10, 5))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("当前用户").small().color(palette::JADE),
+                                );
+                            });
                     });
                 });
             });
@@ -1051,16 +1083,13 @@ impl ZmApp {
             egui::Image::new((texture_id, size)).paint_at(ui, game_rect);
         }
 
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_frame);
-        self.last_frame = now;
         let events = ctx.input(|input| input.raw.events.clone());
-        self.player.tick(GameFrameInput {
-            elapsed,
+        let next_frame = self.player.tick(GameFrameInput {
             viewport: game_rect,
             events,
             focused: response.has_focus() || response.hovered(),
         });
+        ctx.request_repaint_after(next_frame);
         if !self.host_ready
             && self
                 .player
@@ -1161,46 +1190,222 @@ impl ZmApp {
         }
         let mut open = self.account_picker_open;
         let mut selection = None;
-        egui::Window::new("切换账号")
+        let mut deletion = None;
+        let mut add_requested = false;
+        egui::Window::new("管理用户")
             .collapsible(false)
             .resizable(false)
-            .default_width(390.0)
+            .default_width(620.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("选择一个已保存的4399账号").color(palette::MUTED));
-                ui.add_space(6.0);
-                for account in &self.config.accounts {
-                    let selected = self.account_mode == AccountMode::Saved(account.id);
-                    let label = format!("{}\n{}", account.display_name, account.account);
-                    if ui
+                ui.label(egui::RichText::new("集中管理用于登录4399的账号").color(palette::MUTED));
+                ui.add_space(10.0);
+                ui.columns(2, |columns| {
+                    columns[0].label(egui::RichText::new("已保存用户").strong());
+                    columns[0].add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(&mut columns[0], |ui| {
+                            for account in &self.config.accounts {
+                                let selected = self.account_mode == AccountMode::Saved(account.id);
+                                egui::Frame::new()
+                                    .fill(if selected {
+                                        egui::Color32::from_rgb(60, 34, 20)
+                                    } else {
+                                        palette::FIELD
+                                    })
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        if selected {
+                                            palette::GOLD
+                                        } else {
+                                            palette::BORDER
+                                        },
+                                    ))
+                                    .corner_radius(10)
+                                    .inner_margin(egui::Margin::same(10))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&account.display_name)
+                                                        .strong(),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(&account.account)
+                                                        .small()
+                                                        .color(palette::MUTED),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("删除").clicked() {
+                                                        deletion = Some(account.id);
+                                                    }
+                                                    if selected {
+                                                        ui.label(
+                                                            egui::RichText::new("使用中")
+                                                                .small()
+                                                                .color(palette::JADE),
+                                                        );
+                                                    } else if ui.small_button("切换").clicked() {
+                                                        selection =
+                                                            Some(AccountMode::Saved(account.id));
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(6.0);
+                            }
+                            if self.config.accounts.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("暂无用户，请在右侧添加")
+                                        .color(palette::MUTED_DARK),
+                                );
+                            }
+                        });
+
+                    columns[1].label(egui::RichText::new("添加新用户").strong());
+                    columns[1].add_space(6.0);
+                    columns[1].label(egui::RichText::new("用户名").small().strong());
+                    columns[1].add(
+                        egui::TextEdit::singleline(&mut self.manager_account)
+                            .hint_text("请输入4399账号")
+                            .desired_width(f32::INFINITY),
+                    );
+                    columns[1].label(egui::RichText::new("密码").small().strong());
+                    columns[1].add(
+                        egui::TextEdit::singleline(&mut self.manager_password)
+                            .password(true)
+                            .hint_text("请输入账号密码")
+                            .desired_width(f32::INFINITY),
+                    );
+                    columns[1].checkbox(&mut self.manager_save_password, "安全保存到系统密钥环");
+                    columns[1].add_space(6.0);
+                    if columns[1]
                         .add_sized(
-                            [ui.available_width(), 52.0],
-                            egui::Button::new(label).selected(selected),
+                            [columns[1].available_width(), 42.0],
+                            egui::Button::new("＋ 添加并使用")
+                                .fill(palette::VERMILION)
+                                .stroke(egui::Stroke::new(1.0, palette::GOLD)),
                         )
                         .clicked()
                     {
-                        selection = Some(AccountMode::Saved(account.id));
+                        add_requested = true;
                     }
-                }
-                if self.config.accounts.is_empty() {
-                    ui.label("还没有保存的账号");
-                }
-                ui.separator();
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 42.0],
-                        egui::Button::new("＋ 使用其他账号"),
-                    )
-                    .clicked()
-                {
-                    selection = Some(AccountMode::New);
-                }
+                    columns[1].label(
+                        egui::RichText::new("密码不写入配置文件；取消勾选后只在本次运行有效")
+                            .small()
+                            .color(palette::MUTED_DARK),
+                    );
+                });
             });
         self.account_picker_open = open;
+        if let Some(id) = deletion {
+            self.delete_managed_account(id, ctx.clone());
+        }
         if let Some(mode) = selection {
             self.select_account(mode, ctx.clone());
-            self.status = "账号已切换".into();
+            self.status = "用户已切换".into();
+        } else if add_requested {
+            self.add_managed_account(ctx.clone());
         }
+    }
+
+    fn add_managed_account(&mut self, ctx: egui::Context) {
+        let account_name = self.manager_account.trim().to_owned();
+        if account_name.is_empty() || self.manager_password.is_empty() {
+            self.status = "请输入新用户的用户名和密码".into();
+            return;
+        }
+        if self
+            .config
+            .accounts
+            .iter()
+            .any(|account| account.account == account_name)
+        {
+            self.status = "该用户已存在，可直接点击切换".into();
+            return;
+        }
+
+        let account = AccountConfig::new(&account_name);
+        let password = self.manager_password.clone();
+        let save_to_keyring = self.manager_save_password;
+        let previous_last_account = self.config.last_account;
+        self.config.accounts.push(account.clone());
+        self.config.last_account = Some(account.id);
+        if let Err(error) = self.config_store.save(&self.config) {
+            self.config.accounts.retain(|entry| entry.id != account.id);
+            self.config.last_account = previous_last_account;
+            self.status = format!("添加用户失败：{error}");
+            return;
+        }
+
+        let keyring = self.keyring;
+        let session = self.session_credentials.clone();
+        let credential_id = account.credential_id.clone();
+        let credential_account = account.account.clone();
+        self.rt.spawn(async move {
+            if !save_to_keyring
+                || keyring
+                    .save(&credential_id, &credential_account, &password)
+                    .await
+                    .is_err()
+            {
+                let _ = session
+                    .save(&credential_id, &credential_account, &password)
+                    .await;
+            }
+            ctx.request_repaint();
+        });
+
+        self.credential_request_id = self.credential_request_id.wrapping_add(1);
+        self.account_mode = AccountMode::Saved(account.id);
+        self.account = account_name;
+        self.password.clone_from(&self.manager_password);
+        self.credential_state = CredentialState::Available;
+        self.save_password = save_to_keyring;
+        self.manager_account.clear();
+        self.manager_password.clear();
+        self.account_picker_open = false;
+        self.status = "新用户已添加并切换".into();
+    }
+
+    fn delete_managed_account(&mut self, id: Uuid, ctx: egui::Context) {
+        let Some(index) = self.config.accounts.iter().position(|entry| entry.id == id) else {
+            return;
+        };
+        let removed = self.config.accounts.remove(index);
+        let previous_last_account = self.config.last_account;
+        if self.config.last_account == Some(id) {
+            self.config.last_account = None;
+        }
+        if let Err(error) = self.config_store.save(&self.config) {
+            self.config.accounts.insert(index, removed);
+            self.config.last_account = previous_last_account;
+            self.status = format!("删除用户失败：{error}");
+            return;
+        }
+        let keyring = self.keyring;
+        let session = self.session_credentials.clone();
+        let repaint_ctx = ctx.clone();
+        self.rt.spawn(async move {
+            let _ = keyring
+                .delete(&removed.credential_id, &removed.account)
+                .await;
+            let _ = session
+                .delete(&removed.credential_id, &removed.account)
+                .await;
+            repaint_ctx.request_repaint();
+        });
+        if self.account_mode == AccountMode::Saved(id) {
+            self.select_account(AccountMode::New, ctx);
+            self.account_picker_open = true;
+        }
+        self.status = "用户已删除".into();
     }
 
     fn switch_confirmation(&mut self, ctx: &egui::Context) {
@@ -1304,11 +1509,9 @@ impl eframe::App for ZmApp {
         self.account_picker(ctx);
         self.switch_confirmation(ctx);
         self.diagnostics_window(ctx);
-        ctx.request_repaint_after(if self.player.is_running() {
-            Duration::from_millis(8)
-        } else {
-            Duration::from_millis(100)
-        });
+        if !self.player.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn on_exit(&mut self) {
