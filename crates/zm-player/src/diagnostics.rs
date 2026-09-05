@@ -1,3 +1,4 @@
+use crate::runtime::{RuntimeEvent, RuntimeEventSender};
 use ruffle_core::backend::log::LogBackend;
 use std::{
     collections::VecDeque,
@@ -168,7 +169,7 @@ impl CompatibilityMetrics {
             .red_point_updates
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut output = format!(
-            "Compatibility: module_complete={module_completions} loader_mount_trace={loader_mounts}\nVIP: requests={vip_requests} claimed_replies={vip_claimed} red_point_updates={red_point_updates}\n"
+            "Compatibility: module_complete={module_completions} loader_mount_trace={loader_mounts}\nVIP trace matches: requests={vip_requests} claimed_text={vip_claimed} red_point_text={red_point_updates} (zero does not imply a missing reply/update)\n"
         );
         if module_completions > 0 && loader_mounts == 0 {
             output.push_str(
@@ -177,7 +178,7 @@ impl CompatibilityMetrics {
         }
         if vip_claimed > 0 && red_point_updates == 0 {
             output.push_str(
-                "VIP finding=服务端已返回领取状态，但未观察到 checkRedPoint/updateRedPoint 调用\n",
+                "VIP finding=日志含已领取提示，未匹配到红点刷新文本；这些文本计数不能证明回调是否执行\n",
             );
         }
         output
@@ -185,6 +186,7 @@ impl CompatibilityMetrics {
 }
 
 pub(crate) struct RedactingLogBackend {
+    pub(crate) events: RuntimeEventSender,
     pub(crate) traces: Arc<Mutex<VecDeque<String>>>,
     pub(crate) secrets: Arc<Mutex<Vec<String>>>,
     pub(crate) compatibility: Arc<CompatibilityMetrics>,
@@ -202,6 +204,12 @@ impl LogBackend for RedactingLogBackend {
 
 impl RedactingLogBackend {
     fn record(&self, level: &str, message: &str) {
+        if message == "InitGameCmd"
+            || message.starts_with("initgame ")
+            || message.contains("nfLoadBundleAssetsComplete")
+        {
+            let _ = self.events.send(RuntimeEvent::InitializationProgress);
+        }
         register_dynamic_token(message, &self.secrets);
         self.compatibility.record(message);
         let line = format!("{level}: {}", redact(message, &self.secrets));

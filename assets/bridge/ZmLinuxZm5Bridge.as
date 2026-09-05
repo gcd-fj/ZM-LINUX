@@ -1,6 +1,7 @@
 package
 {
    import flash.external.ExternalInterface;
+   import flash.events.Event;
    import flash.utils.getDefinitionByName;
 
    /** ZM-LINUX session bridge for the official ZM5 document class. */
@@ -15,6 +16,13 @@ package
          {
             ExternalInterface.addCallback("zmLinuxApplySession",applySession);
          }
+         if (stage) { installHostCallbacks(); }
+         else { addEventListener(Event.ADDED_TO_STAGE,onAddedToStage); }
+      }
+
+      private function onAddedToStage(event:Event):void
+      {
+         removeEventListener(Event.ADDED_TO_STAGE,onAddedToStage);
          installHostCallbacks();
       }
 
@@ -51,6 +59,7 @@ package
             });
             dispatchLogin(logData);
             applied = true;
+            notify("zmLinux.sessionApplied");
             return true;
          }
          catch (error:*)

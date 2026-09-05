@@ -1,0 +1,25 @@
+--- a/core/src/display_object/avm2_button.rs
++++ b/core/src/display_object/avm2_button.rs
+@@ -611,12 +611,20 @@
+         matrix: &Matrix,
+         include_own_filters: bool,
+         view_matrix: &Matrix,
++        drawing_mask: bool,
+     ) -> Rectangle<Twips> {
+         let mut bounds = *matrix * self.self_bounds(BoundsMode::Engine);
+ 
+-        if let Some(child) = self.get_state_child(self.0.state.get().into()) {
++        if let Some(child) = self.get_state_child(self.0.state.get().into())
++            && (drawing_mask || child.visible())
++        {
+             let matrix = *matrix * child.base().matrix();
+-            bounds = bounds.union(&child.render_bounds_with_transform(&matrix, true, view_matrix));
++            bounds = bounds.union(&child.render_bounds_with_transform(
++                &matrix,
++                true,
++                view_matrix,
++                drawing_mask,
++            ));
+         }
+ 
+         if include_own_filters {

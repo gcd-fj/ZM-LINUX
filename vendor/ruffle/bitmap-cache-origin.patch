@@ -1,0 +1,203 @@
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -105,6 +105,9 @@
+     /// The height of the original bitmap, pre-filters
+     source_height: u32,
+ 
++    /// Bounds origin relative to the transform used to rasterize the cache.
++    source_origin: Point<Twips>,
++
+     /// The offset used to draw the final bitmap (i.e. if a filter increases the size)
+     draw_offset: Point<i32>,
+ 
+@@ -124,13 +127,20 @@
+         self.matrix_a = f32::NAN;
+     }
+ 
+-    fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
++    fn is_dirty(
++        &self,
++        other: &Matrix,
++        source_width: u32,
++        source_height: u32,
++        source_origin: Point<Twips>,
++    ) -> bool {
+         self.matrix_a != other.a
+             || self.matrix_b != other.b
+             || self.matrix_c != other.c
+             || self.matrix_d != other.d
+             || self.source_width != source_width
+             || self.source_height != source_height
++            || self.source_origin != source_origin
+             || self.bitmap.is_none()
+     }
+ 
+@@ -142,6 +152,7 @@
+         matrix: Matrix,
+         source_width: u32,
+         source_height: u32,
++        source_origin: Point<Twips>,
+         actual_width: u32,
+         actual_height: u32,
+         draw_offset: Point<i32>,
+@@ -153,6 +164,7 @@
+         self.matrix_d = matrix.d;
+         self.source_width = source_width;
+         self.source_height = source_height;
++        self.source_origin = source_origin;
+         self.draw_offset = draw_offset;
+         if let Some(current) = &mut self.bitmap
+             && current.width == actual_width
+@@ -973,6 +985,7 @@
+             &base_transform.matrix,
+             false, // we want to do the filter growth for this object ourselves, to know the offsets
+             &context.stage.view_matrix(),
++            context.commands.drawing_mask(),
+         );
+         let name = this.name();
+         let mut filters: Vec<Filter> = this.filters().to_owned();
+@@ -1004,12 +1017,17 @@
+                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
+                 };
+                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+-                if cache.is_dirty(&base_transform.matrix, width, height) {
++                let source_origin = Point::new(
++                    bounds.x_min - base_transform.matrix.tx,
++                    bounds.y_min - base_transform.matrix.ty,
++                );
++                if cache.is_dirty(&base_transform.matrix, width, height, source_origin) {
+                     cache.update(
+                         context.renderer,
+                         base_transform.matrix,
+                         width,
+                         height,
++                        source_origin,
+                         filter_rect.width() as u32,
+                         filter_rect.height() as u32,
+                         draw_offset,
+@@ -1121,6 +1139,7 @@
+                 &context.transform_stack.transform().matrix,
+                 true,
+                 &context.stage.view_matrix(),
++                context.commands.drawing_mask(),
+             );
+             context
+                 .commands
+@@ -1422,14 +1441,24 @@
+         matrix: &Matrix,
+         include_own_filters: bool,
+         view_matrix: &Matrix,
++        drawing_mask: bool,
+     ) -> Rectangle<Twips> {
+         let mut bounds = *matrix * self.self_bounds(BoundsMode::Engine);
+ 
+         if let Some(ctr) = self.as_container() {
+             for child in ctr.iter_render_list() {
++                // Invisible animation must not move the rasterization origin.
++                // Mask rendering deliberately ignores descendant visibility.
++                if !drawing_mask && !child.visible() {
++                    continue;
++                }
+                 let matrix = *matrix * child.base().matrix();
+-                bounds =
+-                    bounds.union(&child.render_bounds_with_transform(&matrix, true, view_matrix));
++                bounds = bounds.union(&child.render_bounds_with_transform(
++                    &matrix,
++                    true,
++                    view_matrix,
++                    drawing_mask,
++                ));
+             }
+         }
+ 
+@@ -3253,3 +3282,90 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod bitmap_cache_regression {
++    use super::*;
++    #[derive(Debug)]
++    struct TestBitmap;
++    impl ruffle_render::bitmap::BitmapHandleImpl for TestBitmap {}
++
++    #[test]
++    fn hidden_animation_does_not_move_render_bounds() {
++        use crate::PlayerBuilder;
++        use crate::display_object::movie_clip::MovieClip;
++        use ruffle_render::shape_utils::DrawCommand;
++        let player = PlayerBuilder::new().build();
++        player
++            .lock()
++            .unwrap()
++            .mutate_with_update_context(|context| {
++                let mut parent = MovieClip::new(context.root_swf.clone(), context.gc());
++                let visible = MovieClip::new(context.root_swf.clone(), context.gc());
++                let hidden = MovieClip::new(context.root_swf.clone(), context.gc());
++                for clip in [visible, hidden] {
++                    let mut drawing = clip.drawing_mut();
++                    drawing.draw_command(DrawCommand::MoveTo(Point::new(Twips::ZERO, Twips::ZERO)));
++                    drawing.draw_command(DrawCommand::LineTo(Point::new(
++                        Twips::from_pixels_i32(40),
++                        Twips::from_pixels_i32(40),
++                    )));
++                }
++                parent.insert_at_index(context, visible.into(), 0);
++                parent.insert_at_index(context, hidden.into(), 1);
++                hidden.set_visible(context, false);
++                let matrix = Matrix::IDENTITY;
++                let expected = visible.render_bounds_with_transform(&matrix, false, &matrix, false);
++                for offset in [-201, -200, -199, 0, 200, 201] {
++                    hidden.set_matrix(Matrix {
++                        tx: Twips::new(offset),
++                        ty: Twips::new(offset),
++                        ..matrix
++                    });
++                    assert_eq!(
++                        parent.render_bounds_with_transform(&matrix, false, &matrix, false),
++                        expected
++                    );
++                }
++                assert_ne!(
++                    parent.render_bounds_with_transform(&matrix, false, &matrix, true),
++                    expected
++                );
++                hidden.set_visible(context, true);
++                assert_ne!(
++                    parent.render_bounds_with_transform(&matrix, false, &matrix, false),
++                    expected
++                );
++            });
++    }
++
++    #[test]
++    fn moving_bounds_origin_invalidates_same_size_cache() {
++        let matrix = Matrix::IDENTITY;
++        let origin = Point::new(Twips::ZERO, Twips::ZERO);
++        let cache = BitmapCache {
++            matrix_a: matrix.a,
++            matrix_b: matrix.b,
++            matrix_c: matrix.c,
++            matrix_d: matrix.d,
++            source_width: 64,
++            source_height: 64,
++            source_origin: origin,
++            bitmap: Some(BitmapInfo {
++                width: 64,
++                height: 64,
++                handle: BitmapHandle(std::sync::Arc::new(TestBitmap)),
++            }),
++            ..Default::default()
++        };
++        assert!(!cache.is_dirty(&matrix, 64, 64, origin));
++        // An invisible animated child can shift bounds without resizing them.
++        assert!(cache.is_dirty(&matrix, 64, 64, Point::new(Twips::new(1), Twips::ZERO)));
++        // Moving the whole object must still reuse its texture.
++        let translated = Matrix {
++            tx: Twips::from_pixels_i32(10),
++            ..matrix
++        };
++        assert!(!cache.is_dirty(&translated, 64, 64, origin));
++    }
++}

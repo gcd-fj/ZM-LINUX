@@ -17,7 +17,7 @@ const AUTH_URL: &str = "https://save.api.4399.com/?ac=user_auth";
 const CAPTCHA_PREFIX: &str = "https://ptlogin.4399.com/ptlogin/captcha.do?captchaId=";
 const USER_AGENT: &str = "4399.air.wd|4399.zm5.air";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LoginRequest<'a> {
     pub account: &'a str,
     pub password: &'a str,
@@ -29,7 +29,7 @@ pub struct CaptchaAnswer<'a> {
     pub id: &'a str,
     pub value: &'a str,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthSession {
     pub uid: u64,
     pub token: String,
@@ -42,7 +42,7 @@ pub struct CaptchaChallenge {
     pub id: String,
     pub image_url: String,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LoginOutcome {
     Authenticated(AuthSession),
     CaptchaRequired(CaptchaChallenge),
@@ -50,6 +50,7 @@ pub enum LoginOutcome {
 
 #[async_trait]
 pub trait AuthClient: Send + Sync {
+    async fn fetch_captcha(&self, image_url: &str) -> Result<Vec<u8>>;
     async fn resolve_uid(&self, account: &str) -> Result<u64>;
     async fn login(&self, request: LoginRequest<'_>) -> Result<LoginOutcome>;
     async fn submit_captcha(&self, request: LoginRequest<'_>) -> Result<LoginOutcome>;
@@ -180,6 +181,9 @@ impl OfficialAuthClient {
 
 #[async_trait]
 impl AuthClient for OfficialAuthClient {
+    async fn fetch_captcha(&self, image_url: &str) -> Result<Vec<u8>> {
+        OfficialAuthClient::fetch_captcha(self, image_url).await
+    }
     async fn resolve_uid(&self, account: &str) -> Result<u64> {
         let mut url = Url::parse(UID_URL).map_err(|e| ZmError::Protocol(e.to_string()))?;
         url.query_pairs_mut().append_pair("uname", account);
@@ -206,17 +210,6 @@ impl AuthClient for OfficialAuthClient {
             return Err(ZmError::Protocol("请输入账号密码".into()));
         }
         let uid = self.resolve_uid(request.account).await?;
-        if let Ok(token) = self
-            .request_game_token(request.game, request.account, uid)
-            .await
-        {
-            return Ok(LoginOutcome::Authenticated(AuthSession {
-                uid,
-                token,
-                display_name: request.account.into(),
-                auth_cookie: self.auth_cookie_header(),
-            }));
-        }
         if let Some(challenge) = self.post_login(&request).await? {
             return Ok(LoginOutcome::CaptchaRequired(challenge));
         }

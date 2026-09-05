@@ -19,5 +19,4 @@ tracing.workspace = true
 url.workspace = true
 zm-core = { path = "../zm-core" }
 
-[dev-dependencies]
 tempfile.workspace = true

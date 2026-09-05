@@ -22,3 +22,6 @@ webbrowser.workspace = true
 wgpu.workspace = true
 zm-assets = { path = "../zm-assets" }
 zm-core = { path = "../zm-core" }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

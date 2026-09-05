@@ -1,0 +1,25 @@
+--- a/core/src/avm2/globals/json.rs
++++ b/core/src/avm2/globals/json.rs
+@@ -9,7 +9,6 @@
+ use crate::avm2::object::{ArrayObject, FunctionObject, Object, ScriptObject, TObject};
+ use crate::avm2::parameters::ParametersExt;
+ use crate::avm2::value::Value;
+-use crate::ecma_conversions::f64_to_wrapping_i32;
+ use crate::string::{AvmString, Units};
+ use ruffle_macros::istr;
+ use serde::Serialize;
+@@ -28,11 +27,9 @@
+         JsonValue::Bool(b) => b.into(),
+         JsonValue::Number(number) => {
+             let number = number.as_f64().unwrap();
+-            if number.fract() == 0.0 {
+-                f64_to_wrapping_i32(number).into()
+-            } else {
+-                number.into()
+-            }
++            // JSON numbers are doubles; narrowing integral timestamps to i32
++            // wraps away their high bits and corrupts date-dependent state.
++            Value::Number(number).try_promote_number()
+         }
+         JsonValue::Object(js_obj) => {
+             let obj = ScriptObject::new_object(activation.context);

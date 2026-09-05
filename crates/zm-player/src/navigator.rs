@@ -1,4 +1,7 @@
-use crate::{diagnostics::ResourceMetrics, runtime::RuntimeEvent};
+use crate::{
+    diagnostics::ResourceMetrics,
+    runtime::{RuntimeEvent, RuntimeEventSender},
+};
 use ruffle_core::{
     backend::navigator::{
         ErrorResponse, NavigationMethod, NavigatorBackend, OwnedFuture, Request, SuccessResponse,
@@ -8,14 +11,7 @@ use ruffle_core::{
     socket::{SocketAction, SocketHandle},
 };
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
-use std::{
-    borrow::Cow,
-    fs::File,
-    io,
-    path::Path,
-    sync::{Arc, mpsc::Sender},
-    time::Duration,
-};
+use std::{borrow::Cow, fs::File, io, path::Path, sync::Arc, time::Duration};
 use url::Url;
 use zm_assets::AssetManager;
 use zm_core::GameKind;
@@ -57,7 +53,7 @@ pub(crate) struct ZmNavigator<N> {
     account: String,
     auth_cookie: String,
     assets: Arc<dyn AssetManager>,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     metrics: Arc<ResourceMetrics>,
 }
 
@@ -73,7 +69,7 @@ impl<N> ZmNavigator<N> {
         inner: N,
         session: NavigatorSession,
         assets: Arc<dyn AssetManager>,
-        events: Sender<RuntimeEvent>,
+        events: RuntimeEventSender,
         metrics: Arc<ResourceMetrics>,
     ) -> Self {
         Self {
@@ -295,10 +291,7 @@ fn is_official_web_url(url: &Url) -> bool {
 }
 
 pub(crate) fn resource_root(game: GameKind) -> &'static str {
-    match game {
-        GameKind::Zm4 => "https://sda.4399.com/4399swf/upload_swf/ftp15/csya/20150127/1/",
-        GameKind::Zm5 => "https://sda.4399.com/4399swf/upload_swf/ftp22/csya/20170622/1/",
-    }
+    game.profile().resource_root
 }
 
 #[cfg(test)]

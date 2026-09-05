@@ -6,14 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-dirs.workspace = true
-keyring.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
-

@@ -1,0 +1,16 @@
+[package]
+name = "zm-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+zm-core = { path = "../zm-core" }
+zm-auth = { path = "../zm-auth" }
+zm-assets = { path = "../zm-assets" }
+zm-storage = { path = "../zm-storage" }
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

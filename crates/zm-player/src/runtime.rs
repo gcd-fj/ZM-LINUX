@@ -29,6 +29,7 @@ use ruffle_render_wgpu::{
 };
 use std::{
     any::Any,
+    cell::RefCell,
     collections::{HashSet, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex, mpsc::Sender},
@@ -45,12 +46,37 @@ pub const GAME_HEIGHT: u32 = 590;
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     HostReady,
+    SessionApplied,
+    InitializationProgress,
     LogoutRequested,
     ShowAccountPicker,
     PaymentBlocked,
     ResourceLoaded { resource: String, cache_hit: bool },
     ResourceLoadFailed { resource: String, error: String },
     FatalError(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeMessage {
+    pub session_id: u64,
+    pub event: RuntimeEvent,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeEventSender {
+    session_id: u64,
+    sender: Sender<RuntimeMessage>,
+}
+impl RuntimeEventSender {
+    pub(crate) fn send(
+        &self,
+        event: RuntimeEvent,
+    ) -> std::result::Result<(), std::sync::mpsc::SendError<RuntimeMessage>> {
+        self.sender.send(RuntimeMessage {
+            session_id: self.session_id,
+            event,
+        })
+    }
 }
 
 fn frame_interval(frame_rate: f64) -> Duration {
@@ -124,6 +150,7 @@ struct EmbeddedSession {
     player: Arc<Mutex<Player>>,
     texture_id: TextureId,
     task_queue: TaskQueue,
+    tasks: LocalTasks,
     game: GameKind,
     account: String,
     started_at: Instant,
@@ -221,10 +248,10 @@ impl RenderTarget for EguiTextureTarget {
 
 /// 使用 egui 同一套 wgpu 设备渲染 Ruffle，只能在 UI 线程中调用。
 pub struct GameRuntime {
-    tokio: tokio::runtime::Runtime,
+    tokio: tokio::runtime::Handle,
     render_state: egui_wgpu::RenderState,
     repaint: egui::Context,
-    events: Sender<RuntimeEvent>,
+    events: Sender<RuntimeMessage>,
     assets: Arc<dyn AssetManager>,
     session: Option<EmbeddedSession>,
     traces: Arc<Mutex<VecDeque<String>>>,
@@ -240,11 +267,12 @@ impl GameRuntime {
     pub fn new(
         render_state: egui_wgpu::RenderState,
         repaint: egui::Context,
-        events: Sender<RuntimeEvent>,
+        events: Sender<RuntimeMessage>,
         assets: Arc<dyn AssetManager>,
+        tokio: tokio::runtime::Handle,
     ) -> Self {
         Self {
-            tokio: tokio::runtime::Runtime::new().expect("create embedded network runtime"),
+            tokio,
             render_state,
             repaint,
             events,
@@ -261,10 +289,16 @@ impl GameRuntime {
     }
 
     pub fn start(&mut self, request: GameLaunchRequest) -> Result<()> {
-        let runtime = self.tokio.handle().clone();
+        let runtime = self.tokio.clone();
         let _runtime_guard = runtime.enter();
         self.stop();
+        let events = RuntimeEventSender {
+            session_id: request.session_id,
+            sender: self.events.clone(),
+        };
         // 每次启动独立统计，避免切换造四/造五后把两款游戏的证据混在一起。
+        self.traces = Arc::new(Mutex::new(VecDeque::with_capacity(160)));
+        self.secrets = Arc::new(Mutex::new(Vec::new()));
         self.resource_metrics = Arc::new(ResourceMetrics::default());
         self.compatibility_metrics = Arc::new(CompatibilityMetrics::default());
         if !request.main_swf.is_file() {
@@ -295,20 +329,23 @@ impl GameRuntime {
             .map_err(|error| ZmError::Runtime(format!("游戏地址无效：{error}")))?;
         let mut host_movie = SwfMovie::from_data(&main_swf, request.movie_url.clone(), None, None)
             .map_err(|error| ZmError::Runtime(format!("游戏主文件损坏：{error}")))?;
-        let (server, port) = game_server(request.game);
+        let profile = request.game.profile();
+        let (server, port) = (profile.server, profile.port);
         host_movie.append_parameters([
             ("path".into(), resource_root(request.game).into()),
             ("uid".into(), request.uid.to_string()),
             ("token".into(), request.auth_token.clone()),
             ("port".into(), port.to_string()),
             ("ip".into(), server.into()),
-            ("username".into(), request.account_display_name.clone()),
+            ("username".into(), request.account_name.clone()),
             ("displayName".into(), request.account_display_name.clone()),
             ("gameId".into(), request.game.game_id().to_string()),
         ]);
 
         let task_queue: TaskQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let tasks: LocalTasks = Rc::new(RefCell::new(Vec::new()));
         let spawner = LocalSpawner {
+            tasks: tasks.clone(),
             queue: task_queue.clone(),
             repaint: self.repaint.clone(),
         };
@@ -331,24 +368,29 @@ impl GameRuntime {
             NavigatorSession {
                 game: request.game,
                 uid: request.uid,
-                account: request.account_display_name.clone(),
+                account: request.account_name.clone(),
                 auth_cookie: request.auth_cookie.clone(),
             },
             self.assets.clone(),
-            self.events.clone(),
+            events.clone(),
             self.resource_metrics.clone(),
         );
         let external = ZmExternalInterface {
             page_url: request.movie_url.clone(),
-            events: self.events.clone(),
+            events: events.clone(),
             secrets: self.secrets.clone(),
         };
         let log = RedactingLogBackend {
+            events,
             traces: self.traces.clone(),
             secrets: self.secrets.clone(),
             compatibility: self.compatibility_metrics.clone(),
         };
-        let save_dir = request.cache_root.join("ruffle/shared-objects");
+        let save_dir = request
+            .storage_root
+            .join("ruffle/shared-objects")
+            .join(request.game.slug())
+            .join(request.uid.to_string());
         let mut builder = PlayerBuilder::new()
             .with_movie(host_movie)
             .with_renderer(renderer)
@@ -357,6 +399,7 @@ impl GameRuntime {
             .with_external_interface(Box::new(external))
             .with_log(log)
             .with_ui(ZmUiBackend::new())
+            .with_max_execution_duration(Duration::from_secs(15))
             .with_autoplay(true)
             .with_load_behavior(LoadBehavior::Delayed)
             .with_viewport_dimensions(GAME_WIDTH, GAME_HEIGHT, 1.0)
@@ -392,6 +435,7 @@ impl GameRuntime {
             player,
             texture_id,
             task_queue,
+            tasks,
             game: request.game,
             account: request.account_display_name,
             started_at: Instant::now(),
@@ -407,7 +451,7 @@ impl GameRuntime {
 
     pub fn tick(&mut self, frame: GameFrameInput) -> Duration {
         let tick_started = Instant::now();
-        let runtime = self.tokio.handle().clone();
+        let runtime = self.tokio.clone();
         let _runtime_guard = runtime.enter();
         let Some(session) = &mut self.session else {
             return Duration::from_millis(100);
@@ -461,6 +505,10 @@ impl GameRuntime {
         let frame_rate = player.frame_rate();
         drop(player);
         run_local_tasks(&session.task_queue);
+        session
+            .tasks
+            .borrow_mut()
+            .retain(|task| !task.is_finished());
         if due {
             self.frame_metrics
                 .record(tick_started.elapsed(), rendered, frame_rate);
@@ -477,7 +525,12 @@ impl GameRuntime {
                 .renderer
                 .write()
                 .free_texture(&session.texture_id);
-            session.task_queue.lock().unwrap().clear();
+            // Dropping task handles cancels pending network futures. Poll their
+            // cancellation on this thread because the AVM futures are !Send.
+            session.tasks.borrow_mut().clear();
+            while !session.task_queue.lock().unwrap().is_empty() {
+                run_local_tasks(&session.task_queue);
+            }
         }
         self.traces.lock().unwrap().clear();
         self.secrets.lock().unwrap().clear();
@@ -506,7 +559,7 @@ impl GameRuntime {
 
     pub fn diagnostics(&self) -> String {
         let mut output = format!(
-            "ZM-LINUX={}\nRuffle revision={}\nMode=embedded\nVolume={:.2}\n",
+            "ZM-LINUX={}\nRuffle revision={}\nRuffle patches=json-number-precision-v1,date-formats-v1,bitmap-cache-origin-v1,timeline-overlay-v2,visible-render-bounds-v1\nMode=embedded\nVolume={:.2}\n",
             env!("CARGO_PKG_VERSION"),
             RUFFLE_REVISION,
             self.volume
@@ -522,6 +575,18 @@ impl GameRuntime {
         }
         if let Some(error) = &self.last_error {
             output.push_str(&format!("Last error={error}\n"));
+        }
+        if let Some(session) = &self.session
+            && session.game.slug() == "zm4"
+        {
+            let state = session.player.lock().unwrap().call_internal_interface(
+                "zmLinuxReadVipState",
+                std::iter::empty::<ExternalValue>(),
+            );
+            if let ExternalValue::String(state) = state {
+                output.push_str(&state);
+                output.push('\n');
+            }
         }
         output.push_str(&self.frame_metrics.summary());
         output.push_str(&self.resource_metrics.summary());
@@ -542,9 +607,11 @@ impl Drop for GameRuntime {
 }
 
 type TaskQueue = Arc<Mutex<VecDeque<async_task::Runnable>>>;
+type LocalTasks = Rc<RefCell<Vec<async_task::Task<()>>>>;
 
 #[derive(Clone)]
 struct LocalSpawner {
+    tasks: LocalTasks,
     queue: TaskQueue,
     repaint: egui::Context,
 }
@@ -563,13 +630,17 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for LocalSpawner {
             repaint.request_repaint();
         };
         let (runnable, task) = async_task::spawn_local(future, schedule);
-        task.detach();
+        self.tasks.borrow_mut().push(task);
         runnable.schedule();
     }
 }
 
 fn run_local_tasks(queue: &TaskQueue) {
+    let started = Instant::now();
     for _ in 0..512 {
+        if started.elapsed() >= Duration::from_millis(4) {
+            break;
+        }
         let Some(runnable) = queue.lock().unwrap().pop_front() else {
             break;
         };
@@ -579,7 +650,7 @@ fn run_local_tasks(queue: &TaskQueue) {
 
 struct ZmExternalInterface {
     page_url: String,
-    events: Sender<RuntimeEvent>,
+    events: RuntimeEventSender,
     secrets: Arc<Mutex<Vec<String>>>,
 }
 
@@ -593,6 +664,10 @@ impl ExternalInterfaceProvider for ZmExternalInterface {
         match name {
             "zmLinux.hostReady" => {
                 let _ = self.events.send(RuntimeEvent::HostReady);
+                ExternalValue::Undefined
+            }
+            "zmLinux.sessionApplied" => {
+                let _ = self.events.send(RuntimeEvent::SessionApplied);
                 ExternalValue::Undefined
             }
             "zmLinux.userLogOut" => {
@@ -648,13 +723,6 @@ impl ExternalInterfaceProvider for ZmExternalInterface {
     }
 }
 
-fn game_server(game: GameKind) -> (&'static str, u16) {
-    match game {
-        GameKind::Zm4 => ("g1-zm4.4399zmxy.com", 3010),
-        GameKind::Zm5 => ("101.42.229.203", 3010),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,8 +766,39 @@ mod tests {
         metrics.record("scene.vipHandler.getDailyReward");
         metrics.record("今日奖励已领取");
         let summary = metrics.summary();
-        assert!(summary.contains("claimed_replies=1"));
-        assert!(summary.contains("red_point_updates=0"));
-        assert!(summary.contains("未观察到 checkRedPoint/updateRedPoint 调用"));
+        assert!(summary.contains("claimed_text=1"));
+        assert!(summary.contains("red_point_text=0"));
+        assert!(summary.contains("这些文本计数不能证明回调是否执行"));
+    }
+    #[test]
+    fn stopping_local_tasks_drops_pending_futures() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let queue: TaskQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let tasks: LocalTasks = Rc::new(RefCell::new(vec![]));
+        let spawner = LocalSpawner {
+            queue: queue.clone(),
+            tasks: tasks.clone(),
+            repaint: egui::Context::default(),
+        };
+        let guard = Dropped(dropped.clone());
+        let future: OwnedFuture<(), std::io::Error> = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        spawner.spawn(future);
+        run_local_tasks(&queue);
+        assert!(!dropped.load(Ordering::SeqCst));
+        tasks.borrow_mut().clear();
+        run_local_tasks(&queue);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(queue.lock().unwrap().is_empty());
     }
 }

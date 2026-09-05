@@ -50,15 +50,17 @@ impl GameKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GameLaunchRequest {
+    pub session_id: u64,
     pub game: GameKind,
+    pub account_name: String,
     pub uid: u64,
     pub account_display_name: String,
     pub auth_token: String,
     /// 已认证的平台 Cookie，仅用于当前内存会话刷新游戏令牌。
     pub auth_cookie: String,
-    pub cache_root: PathBuf,
+    pub storage_root: PathBuf,
     pub main_swf: PathBuf,
     /// 播放缓存内容时用作影片身份的官方地址。
     pub movie_url: String,

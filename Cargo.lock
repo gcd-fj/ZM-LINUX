@@ -4473,7 +4473,6 @@ dependencies = [
 [[package]]
 name = "ruffle_core"
 version = "0.5.0"
-source = "git+https://github.com/ruffle-rs/ruffle.git?rev=a4f5b5256e245693bc9077ef6c6b6abc95490e7f#a4f5b5256e245693bc9077ef6c6b6abc95490e7f"
 dependencies = [
  "async-channel",
  "bitflags 2.13.1",
@@ -7260,6 +7259,7 @@ name = "zm-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "fontdb",
  "image",
  "tempfile",
  "tokio",
@@ -7270,7 +7270,9 @@ dependencies = [
  "zm-assets",
  "zm-auth",
  "zm-core",
+ "zm-launcher",
  "zm-player",
+ "zm-storage",
 ]
 
 [[package]]
@@ -7312,14 +7314,21 @@ dependencies = [
 name = "zm-core"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "dirs",
- "keyring",
  "serde",
- "tempfile",
  "thiserror 2.0.18",
- "toml",
  "uuid",
+]
+
+[[package]]
+name = "zm-launcher"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+ "zm-assets",
+ "zm-auth",
+ "zm-core",
+ "zm-storage",
 ]
 
 [[package]]
@@ -7337,10 +7346,26 @@ dependencies = [
  "ruffle_render_wgpu",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "webbrowser",
  "wgpu",
  "zm-assets",
+ "zm-core",
+]
+
+[[package]]
+name = "zm-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "keyring",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "uuid",
  "zm-core",
 ]
 

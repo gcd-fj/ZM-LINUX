@@ -1,0 +1,58 @@
+--- a/core/src/avm2/globals/date.rs
++++ b/core/src/avm2/globals/date.rs
+@@ -1065,11 +1065,11 @@
+     let parsed = if first.len() == 4 {
+         // If the first item in this date is 4 characters long, we parse as YYYY/MM/DD
+         let month = iter.next()?;
+-        if month.len() != 2 {
++        if !(1..=2).contains(&month.len()) {
+             return None;
+         }
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         (
+@@ -1077,10 +1077,10 @@
+             month.parse::<u32>().ok()?.checked_sub(1)?,
+             day.parse::<u32>().ok()?,
+         )
+-    } else if first.len() == 2 {
++    } else if (1..=2).contains(&first.len()) {
+         // If the first item in this date is 2 characters long, we parse as MM/DD/YYYY
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         let year = iter.next()?;
+@@ -1098,7 +1098,7 @@
+         // First lets parse the Month
+         let month = parse_mon(first)?;
+         let day = iter.next()?;
+-        if day.len() != 2 {
++        if !(1..=2).contains(&day.len()) {
+             return None;
+         }
+         let year = iter.next()?;
+@@ -1133,15 +1133,15 @@
+ fn parse_hms(item: &WStr) -> Option<(u32, u32, u32)> {
+     let mut iter = item.split(b':');
+     let hours = iter.next()?;
+-    if hours.len() != 2 {
++    if !(1..=2).contains(&hours.len()) {
+         return None;
+     }
+     let minutes = iter.next()?;
+-    if minutes.len() != 2 {
++    if !(1..=2).contains(&minutes.len()) {
+         return None;
+     }
+-    let seconds = iter.next()?;
+-    if seconds.len() != 2 {
++    let seconds = iter.next().unwrap_or(WStr::from_units(b"00"));
++    if !(1..=2).contains(&seconds.len()) {
+         return None;
+     }
+     if iter.next().is_some() {

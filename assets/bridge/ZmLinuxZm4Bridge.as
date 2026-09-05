@@ -1,6 +1,7 @@
 package
 {
    import flash.external.ExternalInterface;
+   import flash.events.Event;
    import flash.utils.getDefinitionByName;
 
    /** ZM-LINUX session bridge for the official ZM4 document class. */
@@ -14,7 +15,15 @@ package
          if (ExternalInterface.available)
          {
             ExternalInterface.addCallback("zmLinuxApplySession",applySession);
+            ExternalInterface.addCallback("zmLinuxReadVipState",readVipState);
          }
+         if (stage) { installHostCallbacks(); }
+         else { addEventListener(Event.ADDED_TO_STAGE,onAddedToStage); }
+      }
+
+      private function onAddedToStage(event:Event):void
+      {
+         removeEventListener(Event.ADDED_TO_STAGE,onAddedToStage);
          installHostCallbacks();
       }
 
@@ -51,12 +60,42 @@ package
             });
             dispatchLogin(logData);
             applied = true;
+            notify("zmLinux.sessionApplied");
             return true;
          }
          catch (error:*)
          {
             notify("zmLinux.hostError","造梦西游4会话注入失败：" + error);
             return false;
+         }
+      }
+
+      // Read only: never infer a claim or change server-owned reward records.
+      public function readVipState():String
+      {
+         try
+         {
+            var vipClass:Object = getDefinitionByName("models.managers.VipModelManager");
+            var weekClass:Object = getDefinitionByName("models.managers.EveryWeekManager");
+            var dateClass:Object = getDefinitionByName("models.managers.DateModelManager");
+            var vip:Object = vipClass.getIns();
+            var week:Object = weekClass.getIns();
+            var date:Date = dateClass.getIns().getServeDate();
+            var levels:Array = [];
+            for each (var gift:Object in vip.vipGiftList)
+            {
+               levels.push(int(gift.vipLevel));
+            }
+            return "VIP state: level=" + vip.vipLevel +
+               " daily_claimed=" + week.vipDailyReward +
+               " reward_key=" + week.getEveryDayKey2("vipDailyReward") +
+               " claimed_levels=" + levels.join(",") +
+               " server_date=" + date.toString() +
+               " timezone_offset_minutes=" + date.timezoneOffset;
+         }
+         catch (error:*)
+         {
+            return "VIP state: unavailable (game model not ready)";
          }
       }
 

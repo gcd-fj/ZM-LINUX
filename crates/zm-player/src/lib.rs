@@ -6,4 +6,5 @@ mod ui_backend;
 
 pub use runtime::{
     GAME_HEIGHT, GAME_WIDTH, GameFrameInput, GameRuntime, RUFFLE_REVISION, RuntimeEvent,
+    RuntimeMessage,
 };

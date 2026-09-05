@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/zm-app", "crates/zm-assets", "crates/zm-auth", "crates/zm-core", "crates/zm-player"]
+members = ["crates/zm-app", "crates/zm-assets", "crates/zm-auth", "crates/zm-core", "crates/zm-player", "crates/zm-storage", "crates/zm-launcher"]
+exclude = ["vendor/ruffle/core"]
 resolver = "2"
 
 [workspace.package]
@@ -54,3 +55,11 @@ ruffle-render-wgpu = { package = "ruffle_render_wgpu", git = "https://github.com
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Ruffle interprets substantial game code during initialization. Keep normal
+# cargo run usable while retaining symbols and assertions for first-party code.
+[profile.dev.package."*"]
+opt-level = 2
+
+[patch."https://github.com/ruffle-rs/ruffle.git"]
+ruffle_core = { path = "vendor/ruffle/core" }

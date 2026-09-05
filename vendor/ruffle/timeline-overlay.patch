@@ -1,0 +1,68 @@
+--- a/core/src/display_object/movie_clip.rs
++++ b/core/src/display_object/movie_clip.rs
+@@ -1752,6 +1752,7 @@
+         }
+         let hit_target_frame = self.0.current_frame() == frame;
+ 
++        let mut rewind_anchors = HashMap::new();
+         if is_rewind {
+             // Remove all display objects that were created after the
+             // destination frame.
+@@ -1771,6 +1772,24 @@
+                 .filter(|child| !self.survives_rewind(*child, &final_placements, frame))
+                 .collect();
+ 
++            // Remember surviving siblings above replaced timeline objects. A
++            // replacement must not jump above an AS3 addChild overlay on rewind.
++            if self.movie().is_action_script_3() {
++                let render_list: Vec<_> = self.iter_render_list().collect();
++                for (index, child) in render_list.iter().copied().enumerate() {
++                    if !child.placed_by_avm2_script()
++                        && children.iter().any(|c| DisplayObject::ptr_eq(*c, child))
++                        && final_placements.contains_key(&child.depth())
++                        && let Some(anchor) =
++                            render_list[index + 1..].iter().copied().find(|next| {
++                                next.placed_by_avm2_script()
++                                    || !children.iter().any(|c| DisplayObject::ptr_eq(*c, *next))
++                            })
++                    {
++                        rewind_anchors.insert(child.depth(), anchor);
++                    }
++                }
++            }
+             for child in children {
+                 if !child.placed_by_avm2_script() {
+                     self.remove_child(context, child);
+@@ -1781,7 +1800,7 @@
+         }
+ 
+         // Run the list of goto commands to actually create and update the display objects.
+-        let run_goto_command = |clip: MovieClip<'gc>,
++        let run_goto_command = |mut clip: MovieClip<'gc>,
+                                 context: &mut UpdateContext<'gc>,
+                                 params: &GotoPlaceObject<'_>| {
+             use swf::PlaceObjectAction;
+@@ -1829,6 +1848,23 @@
+                     {
+                         // Set the place frame to the frame where the object *would* have been placed.
+                         child.set_place_frame(params.frame);
++                        if let Some(anchor) = rewind_anchors.get(&params.depth()) {
++                            let index = clip
++                                .iter_render_list()
++                                .position(|c| DisplayObject::ptr_eq(c, *anchor));
++                            // Depth insertion may already have placed the child below
++                            // the anchor. Moving it to the anchor's old index would
++                            // then put it ABOVE the anchor after removal.
++                            let child_index = clip
++                                .iter_render_list()
++                                .position(|c| DisplayObject::ptr_eq(c, child));
++                            if let (Some(index), Some(child_index)) = (index, child_index)
++                                && child_index > index
++                            {
++                                clip.insert_at_index(context, child, index);
++                                child.set_place_frame(params.frame);
++                            }
++                        }
+                     }
+                 }
+                 _ => {
