@@ -29,6 +29,7 @@ use crate::{
 };
 const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(90);
 mod accounts;
+mod home;
 mod views;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -168,7 +169,7 @@ impl ZmApp {
             captcha_url: None,
             captcha_texture: None,
             app_icon,
-            status: "请选择游戏".into(),
+            status: "准备就绪".into(),
             active_game: None,
             active_account: None,
             selected_game: GameKind::Zm4,
@@ -233,6 +234,20 @@ impl ZmApp {
                 });
             }
         }
+    }
+
+    fn select_game(&mut self, game: GameKind) {
+        if self.selected_game == game {
+            return;
+        }
+        self.selected_game = game;
+        self.launch.cancel();
+        self.captcha_revision = self.captcha_revision.wrapping_add(1);
+        self.captcha_id = None;
+        self.captcha_url = None;
+        self.captcha_texture = None;
+        self.captcha_value.clear();
+        self.status = format!("已选择 {}", game.display_name());
     }
 
     fn begin_login(&mut self, game: GameKind, ctx: egui::Context) {
