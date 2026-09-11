@@ -492,8 +492,11 @@ impl ZmApp {
                 RuntimeEvent::LogoutRequested | RuntimeEvent::ShowAccountPicker => {
                     self.confirm_switch = true
                 }
-                RuntimeEvent::PaymentBlocked => {
-                    self.status = "客户端暂不支持直接打开支付页面".into()
+                RuntimeEvent::PaymentOpened => {
+                    self.status = "已在默认浏览器打开4399官方充值页面".into()
+                }
+                RuntimeEvent::PaymentOpenFailed(error) => {
+                    self.status = format!("无法打开默认浏览器：{error}")
                 }
                 RuntimeEvent::ResourceLoaded { .. } => {
                     if self.launch.stage() != LaunchStage::SessionApplied {

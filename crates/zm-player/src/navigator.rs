@@ -28,12 +28,8 @@ pub(crate) struct RestrictedNavigatorInterface;
 
 impl NavigatorInterface for RestrictedNavigatorInterface {
     fn navigate_to_website(&self, url: Url) {
-        if is_official_web_url(&url) {
-            if let Err(error) = webbrowser::open(url.as_str()) {
-                tracing::warn!("无法打开官方页面：{error}");
-            }
-        } else {
-            tracing::warn!(url = %url, "已阻止非官方页面跳转");
+        if let Err(error) = open_official_web_url(&url) {
+            tracing::warn!(url = %url, "无法打开页面：{error}");
         }
     }
 
@@ -47,6 +43,13 @@ impl NavigatorInterface for RestrictedNavigatorInterface {
     async fn confirm_socket(&self, host: &str, _port: u16) -> bool {
         host.ends_with(".4399zmxy.com") || host.parse::<std::net::IpAddr>().is_ok()
     }
+}
+
+pub(crate) fn open_official_web_url(url: &Url) -> Result<(), String> {
+    if !is_official_web_url(url) {
+        return Err("已阻止非官方页面跳转".into());
+    }
+    webbrowser::open(url.as_str()).map_err(|error| error.to_string())
 }
 
 /// 规范化游戏内鉴权请求，并把官方静态 GET 资源接入统一缓存。

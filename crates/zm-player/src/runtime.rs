@@ -3,7 +3,10 @@ use crate::{
         CompatibilityMetrics, FrameMetrics, RedactingLogBackend, ResourceMetrics, redact,
     },
     input::{event_needs_game_focus, forward_event},
-    navigator::{NavigatorSession, RestrictedNavigatorInterface, ZmNavigator, resource_root},
+    navigator::{
+        NavigatorSession, RestrictedNavigatorInterface, ZmNavigator, open_official_web_url,
+        resource_root,
+    },
     ui_backend::ZmUiBackend,
 };
 use egui::{Rect, TextureId};
@@ -50,7 +53,8 @@ pub enum RuntimeEvent {
     InitializationProgress,
     LogoutRequested,
     ShowAccountPicker,
-    PaymentBlocked,
+    PaymentOpened,
+    PaymentOpenFailed(String),
     ResourceLoaded { resource: String, cache_hit: bool },
     ResourceLoadFailed { resource: String, error: String },
     FatalError(String),
@@ -397,6 +401,9 @@ impl GameRuntime {
         );
         let external = ZmExternalInterface {
             page_url: request.movie_url.clone(),
+            game: request.game,
+            uid: request.uid,
+            account: request.account_name.clone(),
             events: events.clone(),
             secrets: self.secrets.clone(),
         };
@@ -680,8 +687,22 @@ fn run_local_tasks(queue: &TaskQueue) {
 
 struct ZmExternalInterface {
     page_url: String,
+    game: GameKind,
+    uid: u64,
+    account: String,
     events: RuntimeEventSender,
     secrets: Arc<Mutex<Vec<String>>>,
+}
+
+fn payment_url(game: GameKind, uid: u64, account: &str) -> Url {
+    let mut url = Url::parse("https://save.api.4399.com/exchange/v2/flash/Pay")
+        .expect("static payment URL must be valid");
+    url.query_pairs_mut()
+        .append_pair("gameid", &game.game_id().to_string())
+        .append_pair("userid", &uid.to_string())
+        .append_pair("username", account)
+        .append_pair("money", "10");
+    url
 }
 
 impl ExternalInterfaceProvider for ZmExternalInterface {
@@ -709,7 +730,12 @@ impl ExternalInterfaceProvider for ZmExternalInterface {
                 ExternalValue::Undefined
             }
             "zmLinux.payMoney" => {
-                let _ = self.events.send(RuntimeEvent::PaymentBlocked);
+                let url = payment_url(self.game, self.uid, &self.account);
+                let event = match open_official_web_url(&url) {
+                    Ok(()) => RuntimeEvent::PaymentOpened,
+                    Err(error) => RuntimeEvent::PaymentOpenFailed(error),
+                };
+                let _ = self.events.send(event);
                 ExternalValue::Undefined
             }
             "zmLinux.hostError" => {
@@ -822,6 +848,30 @@ mod tests {
         assert!(summary.contains("red_point_text=0"));
         assert!(summary.contains("这些文本计数不能证明回调是否执行"));
     }
+
+    #[test]
+    fn payment_url_uses_the_selected_game_and_account() {
+        let url = payment_url(GameKind::Zm5, 3940522873, "测试 account");
+        let pairs = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("save.api.4399.com"));
+        assert_eq!(
+            pairs.get("gameid").map(|value| value.as_ref()),
+            Some("100051601")
+        );
+        assert_eq!(
+            pairs.get("userid").map(|value| value.as_ref()),
+            Some("3940522873")
+        );
+        assert_eq!(
+            pairs.get("username").map(|value| value.as_ref()),
+            Some("测试 account")
+        );
+        assert_eq!(pairs.get("money").map(|value| value.as_ref()), Some("10"));
+    }
+
     #[test]
     fn stopping_local_tasks_drops_pending_futures() {
         use std::sync::atomic::{AtomicBool, Ordering};
