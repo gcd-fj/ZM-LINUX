@@ -13,6 +13,7 @@ regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
+swf.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

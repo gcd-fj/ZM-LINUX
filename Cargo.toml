@@ -33,6 +33,7 @@ regex = "1.12.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["cookies", "form", "gzip", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
+swf = "0.2.2"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.49.0", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }

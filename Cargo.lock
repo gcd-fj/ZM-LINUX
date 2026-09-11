@@ -7286,6 +7286,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "sha2",
+ "swf 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
  "tokio",
  "toml",

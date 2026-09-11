@@ -15,7 +15,7 @@ use zm_core::{GameKind, Result, ZmError};
 mod swf_patch;
 
 const HOME_URL: &str = "https://www.4399.com/flash/zmhj.htm";
-const PATCH_VERSION: u32 = 4;
+const PATCH_VERSION: u32 = 5;
 const ZM4_BRIDGE_ABC: &[u8] = include_bytes!("../../../assets/bridge/ZmLinuxZm4Bridge.abc");
 const ZM5_BRIDGE_ABC: &[u8] = include_bytes!("../../../assets/bridge/ZmLinuxZm5Bridge.abc");
 
@@ -424,8 +424,7 @@ impl OfficialAssetManager {
             .get_bytes(&version.swf_url, Some(&version.page_url))
             .await?;
         let raw_sha256 = digest(&source);
-        let bytes =
-            swf_patch::inject_bridge(&source, bridge_abc(game), game.profile().bridge_class)?;
+        let bytes = swf_patch::inject_bridge(&source, bridge_abc(game), game)?;
         let sha256 = digest(&bytes);
         let dir = self.game_dir(game);
         let path = dir.join("versions").join(format!("{sha256}.swf"));
