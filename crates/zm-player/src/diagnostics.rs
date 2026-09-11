@@ -12,17 +12,29 @@ pub(crate) struct ResourceMetrics {
     downloads: std::sync::atomic::AtomicU64,
     failures: std::sync::atomic::AtomicU64,
     dynamic_modules: std::sync::atomic::AtomicU64,
+    cache_micros: std::sync::atomic::AtomicU64,
+    cache_peak_micros: std::sync::atomic::AtomicU64,
+    download_micros: std::sync::atomic::AtomicU64,
+    download_peak_micros: std::sync::atomic::AtomicU64,
     recent: Mutex<VecDeque<String>>,
 }
 
 impl ResourceMetrics {
-    pub(crate) fn record_success(&self, resource: &str, cache_hit: bool) {
+    pub(crate) fn record_success(&self, resource: &str, cache_hit: bool, elapsed: Duration) {
         let counter = if cache_hit {
             &self.cache_hits
         } else {
             &self.downloads
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let elapsed_micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        let (total, peak) = if cache_hit {
+            (&self.cache_micros, &self.cache_peak_micros)
+        } else {
+            (&self.download_micros, &self.download_peak_micros)
+        };
+        total.fetch_add(elapsed_micros, std::sync::atomic::Ordering::Relaxed);
+        peak.fetch_max(elapsed_micros, std::sync::atomic::Ordering::Relaxed);
         if resource.to_ascii_lowercase().ends_with(".swf") {
             self.dynamic_modules
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -58,8 +70,22 @@ impl ResourceMetrics {
         let dynamic_modules = self
             .dynamic_modules
             .load(std::sync::atomic::Ordering::Relaxed);
+        let cache_total = self.cache_micros.load(std::sync::atomic::Ordering::Relaxed);
+        let cache_peak = self
+            .cache_peak_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let download_total = self
+            .download_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let download_peak = self
+            .download_peak_micros
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut output = format!(
-            "Resources: cache_hits={hits} downloads={downloads} failures={failures} dynamic_swf_ready={dynamic_modules}\n"
+            "Resources: cache_hits={hits} downloads={downloads} failures={failures} dynamic_swf_ready={dynamic_modules}\nResource timing: cache_avg_ms={:.2} cache_peak_ms={:.2} download_avg_ms={:.2} download_peak_ms={:.2}\n",
+            average_millis(cache_total, hits),
+            cache_peak as f64 / 1000.0,
+            average_millis(download_total, downloads),
+            download_peak as f64 / 1000.0,
         );
         for entry in self.recent.lock().unwrap().iter() {
             output.push_str("Resource: ");
@@ -73,6 +99,7 @@ impl ResourceMetrics {
 #[derive(Debug, Default)]
 pub(crate) struct FrameMetrics {
     samples: VecDeque<Duration>,
+    schedule_delays: VecDeque<Duration>,
     rendered_frames: u64,
     ticks: u64,
     frame_rate: f64,
@@ -80,12 +107,22 @@ pub(crate) struct FrameMetrics {
 }
 
 impl FrameMetrics {
-    pub(crate) fn record(&mut self, elapsed: Duration, rendered: bool, frame_rate: f64) {
+    pub(crate) fn record(
+        &mut self,
+        elapsed: Duration,
+        schedule_delay: Duration,
+        rendered: bool,
+        frame_rate: f64,
+    ) {
         self.started_at.get_or_insert_with(Instant::now);
         if self.samples.len() >= 120 {
             self.samples.pop_front();
         }
         self.samples.push_back(elapsed);
+        if self.schedule_delays.len() >= 120 {
+            self.schedule_delays.pop_front();
+        }
+        self.schedule_delays.push_back(schedule_delay);
         self.ticks += 1;
         self.rendered_frames += u64::from(rendered);
         if frame_rate.is_finite() && frame_rate > 0.0 {
@@ -106,14 +143,38 @@ impl FrameMetrics {
             .map(Duration::as_secs_f64)
             .fold(0.0, f64::max)
             * 1000.0;
+        let average_late_ms = if self.schedule_delays.is_empty() {
+            0.0
+        } else {
+            self.schedule_delays
+                .iter()
+                .map(Duration::as_secs_f64)
+                .sum::<f64>()
+                * 1000.0
+                / self.schedule_delays.len() as f64
+        };
+        let peak_late_ms = self
+            .schedule_delays
+            .iter()
+            .map(Duration::as_secs_f64)
+            .fold(0.0, f64::max)
+            * 1000.0;
         let actual_fps = self
             .started_at
             .map(|started| self.ticks as f64 / started.elapsed().as_secs_f64().max(0.001))
             .unwrap_or(0.0);
         format!(
-            "Frames: source_fps={:.2} actual_fps={actual_fps:.2} ticks={} renders={} avg_tick_ms={average_ms:.2} peak_tick_ms={peak_ms:.2}\n",
+            "Frames: source_fps={:.2} actual_fps={actual_fps:.2} ticks={} renders={} avg_tick_ms={average_ms:.2} peak_tick_ms={peak_ms:.2} avg_late_ms={average_late_ms:.2} peak_late_ms={peak_late_ms:.2}\n",
             self.frame_rate, self.ticks, self.rendered_frames
         )
+    }
+}
+
+fn average_millis(total_micros: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_micros as f64 / count as f64 / 1000.0
     }
 }
 

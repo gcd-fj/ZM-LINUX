@@ -59,6 +59,7 @@ pub struct OfficialAssetManager {
     lifecycle: Arc<RwLock<()>>,
     cache_root: PathBuf,
     in_flight: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    runtime_dirs: Arc<RwLock<HashMap<GameKind, PathBuf>>>,
     resource_roots: Arc<HashMap<GameKind, Url>>,
     #[cfg(test)]
     test_responses: Option<Arc<TestResponses>>,
@@ -82,6 +83,7 @@ impl OfficialAssetManager {
             client,
             cache_root: cache_root.into(),
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            runtime_dirs: Arc::new(RwLock::new(HashMap::new())),
             resource_roots: Arc::new(Self::default_resource_roots()),
             #[cfg(test)]
             test_responses: None,
@@ -179,6 +181,9 @@ impl OfficialAssetManager {
     }
 
     async fn runtime_resource_dir(&self, game: GameKind) -> PathBuf {
+        if let Some(directory) = self.runtime_dirs.read().await.get(&game) {
+            return directory.clone();
+        }
         let manifest_path = self.game_dir(game).join("manifest.toml");
         let namespace = tokio::fs::read_to_string(manifest_path)
             .await
@@ -194,7 +199,17 @@ impl OfficialAssetManager {
                 )
             })
             .unwrap_or_else(|| format!("patch{PATCH_VERSION}-unknown"));
-        self.game_dir(game).join("resources").join(namespace)
+        let directory = self.game_dir(game).join("resources").join(namespace);
+        self.runtime_dirs
+            .write()
+            .await
+            .entry(game)
+            .or_insert_with(|| directory.clone())
+            .clone()
+    }
+
+    async fn invalidate_runtime_resource_dir(&self, game: GameKind) {
+        self.runtime_dirs.write().await.remove(&game);
     }
 
     async fn resource_lock(&self, path: &Path) -> Arc<Mutex<()>> {
@@ -332,7 +347,7 @@ impl AssetManager for OfficialAssetManager {
                 .await
                 .map_err(|e| ZmError::io(parent, e))?;
         }
-        atomic_write(&local, bytes.clone(), lifecycle, _resource_guard).await?;
+        atomic_cache_write(&local, bytes.clone(), lifecycle, _resource_guard).await?;
         Ok(RuntimeAsset {
             bytes,
             cache_hit: false,
@@ -342,8 +357,14 @@ impl AssetManager for OfficialAssetManager {
     async fn clear_cache(&self, scope: CacheScope) -> Result<()> {
         let _lifecycle = self.lifecycle.write().await;
         let target = match scope {
-            CacheScope::Game(game) => self.game_dir(game),
-            CacheScope::All => self.cache_root.clone(),
+            CacheScope::Game(game) => {
+                self.invalidate_runtime_resource_dir(game).await;
+                self.game_dir(game)
+            }
+            CacheScope::All => {
+                self.runtime_dirs.write().await.clear();
+                self.cache_root.clone()
+            }
         };
         if target.exists() {
             tokio::fs::remove_dir_all(&target)
@@ -427,6 +448,7 @@ impl OfficialAssetManager {
         })
         .await
         .map_err(|error| ZmError::Asset(error.to_string()))??;
+        self.invalidate_runtime_resource_dir(game).await;
         Ok(GameAsset {
             version,
             path,
@@ -436,7 +458,7 @@ impl OfficialAssetManager {
     }
 }
 
-async fn atomic_write(
+async fn atomic_cache_write(
     path: &Path,
     bytes: Vec<u8>,
     lifecycle: tokio::sync::OwnedRwLockReadGuard<()>,
@@ -444,9 +466,10 @@ async fn atomic_write(
 ) -> Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        // Keep both locks until publication finishes, even if the awaiting task is cancelled.
+        // Runtime resources are disposable cache entries. Atomic publication
+        // is enough; fsync on every image and SWF delays their first display.
         let (_lifecycle, _guard) = (lifecycle, guard);
-        atomic_write_sync(&path, &bytes)
+        atomic_cache_write_sync(&path, &bytes)
     })
     .await
     .map_err(|error| ZmError::Asset(error.to_string()))?
@@ -464,6 +487,21 @@ fn atomic_write_sync(path: &Path, bytes: &[u8]) -> Result<()> {
         .map_err(|error| ZmError::io(path, error))?;
     file.as_file()
         .sync_all()
+        .map_err(|error| ZmError::io(path, error))?;
+    file.persist(path)
+        .map_err(|error| ZmError::io(path, error.error))?;
+    Ok(())
+}
+
+fn atomic_cache_write_sync(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ZmError::Asset("缓存路径缺少父目录".into()))?;
+    std::fs::create_dir_all(parent).map_err(|error| ZmError::io(parent, error))?;
+    let mut file =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| ZmError::io(parent, error))?;
+    file.write_all(bytes)
         .map_err(|error| ZmError::io(path, error))?;
     file.persist(path)
         .map_err(|error| ZmError::io(path, error.error))?;
@@ -518,6 +556,7 @@ mod tests {
         )
         .await
         .unwrap();
+        manager.invalidate_runtime_resource_dir(game).await;
     }
 
     #[test]
@@ -623,6 +662,7 @@ mod tests {
                 toml::to_string(&manifest).unwrap(),
             ))
             .unwrap();
+        runtime.block_on(manager.invalidate_runtime_resource_dir(GameKind::Zm4));
         let third = runtime.block_on(manager.runtime_resource_dir(GameKind::Zm4));
         assert_ne!(second, third);
     }

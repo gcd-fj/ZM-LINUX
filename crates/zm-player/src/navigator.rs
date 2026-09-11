@@ -11,7 +11,14 @@ use ruffle_core::{
     socket::{SocketAction, SocketHandle},
 };
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
-use std::{borrow::Cow, fs::File, io, path::Path, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    fs::File,
+    io,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use url::Url;
 use zm_assets::AssetManager;
 use zm_core::GameKind;
@@ -126,9 +133,10 @@ impl<N: NavigatorBackend> NavigatorBackend for ZmNavigator<N> {
             let metrics = self.metrics.clone();
             let game = self.game;
             return Box::pin(async move {
+                let started = Instant::now();
                 match assets.fetch_resource(game, &resource).await {
                     Ok(asset) => {
-                        metrics.record_success(&resource, asset.cache_hit);
+                        metrics.record_success(&resource, asset.cache_hit, started.elapsed());
                         let _ = events.send(RuntimeEvent::ResourceLoaded {
                             resource: resource.clone(),
                             cache_hit: asset.cache_hit,

@@ -93,6 +93,26 @@ fn should_submit_render(frame_due: bool, needs_render: bool) -> bool {
     frame_due && needs_render
 }
 
+fn advance_frame_deadline(previous: Instant, completed_at: Instant, interval: Duration) -> Instant {
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return completed_at;
+    }
+    let intervals = completed_at
+        .saturating_duration_since(previous)
+        .as_nanos()
+        .checked_div(interval_nanos)
+        .unwrap_or(0)
+        .saturating_add(1);
+    if intervals > u32::MAX as u128 {
+        return completed_at.checked_add(interval).unwrap_or(completed_at);
+    }
+    previous
+        .checked_add(interval.saturating_mul(intervals as u32))
+        .or_else(|| completed_at.checked_add(interval))
+        .unwrap_or(completed_at)
+}
+
 fn configure_default_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Serif,
@@ -490,13 +510,18 @@ impl GameRuntime {
         let frame_rate = player.frame_rate();
         let interval = frame_interval(frame_rate);
         let due = now >= session.next_tick_at;
+        let schedule_delay = now.saturating_duration_since(session.next_tick_at);
         if due {
             let elapsed = now
                 .saturating_duration_since(session.last_tick_at)
                 .min(Duration::from_millis(250));
             player.tick(FloatDuration::from_millis(elapsed.as_secs_f64() * 1000.0));
             session.last_tick_at = now;
-            session.next_tick_at = now + frame_interval(player.frame_rate());
+            session.next_tick_at = advance_frame_deadline(
+                session.next_tick_at,
+                Instant::now(),
+                frame_interval(player.frame_rate()),
+            );
         }
         let rendered = should_submit_render(due, player.needs_render());
         if rendered {
@@ -511,7 +536,7 @@ impl GameRuntime {
             .retain(|task| !task.is_finished());
         if due {
             self.frame_metrics
-                .record(tick_started.elapsed(), rendered, frame_rate);
+                .record(tick_started.elapsed(), schedule_delay, rendered, frame_rate);
         }
         session
             .next_tick_at
@@ -564,6 +589,11 @@ impl GameRuntime {
             RUFFLE_REVISION,
             self.volume
         );
+        let adapter = self.render_state.adapter.get_info();
+        output.push_str(&format!(
+            "GPU: name={} backend={:?} type={:?}\n",
+            adapter.name, adapter.backend, adapter.device_type
+        ));
         if let Some(session) = &self.session {
             output.push_str(&format!(
                 "Game={}\nAccount={}\n",
@@ -758,6 +788,28 @@ mod tests {
         assert!(!should_submit_render(true, false));
         assert!(!should_submit_render(false, true));
         assert!(!should_submit_render(false, false));
+    }
+
+    #[test]
+    fn frame_deadline_keeps_its_cadence_after_a_late_wakeup() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let completed = start + Duration::from_millis(17);
+        assert_eq!(
+            advance_frame_deadline(start, completed, interval),
+            start + Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn frame_deadline_skips_missed_intervals_after_a_long_pause() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let completed = start + Duration::from_millis(95);
+        assert_eq!(
+            advance_frame_deadline(start, completed, interval),
+            start + Duration::from_millis(100)
+        );
     }
 
     #[test]
