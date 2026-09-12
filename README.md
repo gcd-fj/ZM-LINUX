@@ -34,6 +34,8 @@ cargo build --release --locked --bin zm-linux
 ./target/release/zm-linux
 ```
 
+分段耗时、空闲 CPU/RSS 采样及两款游戏的性能验收步骤见 [性能采样与验收](docs/PERFORMANCE.md)。诊断中的 `tick_hz` 表示宿主调用播放器的频率，不等同于实际游戏呈现帧率。
+
 Windows 使用 MSVC Rust 工具链及 Visual Studio C++ 构建工具，执行同样的 Cargo 命令，程序为 `target/release/zm-linux.exe`。
 
 ```bash

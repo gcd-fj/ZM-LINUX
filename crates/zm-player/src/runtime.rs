@@ -390,6 +390,7 @@ impl GameRuntime {
         self.startup_metrics
             .movie_parse
             .record(parse_started.elapsed());
+        let source_frame_rate: f64 = host_movie.frame_rate().into();
         let profile = request.game.profile();
         let (server, port) = (profile.server, profile.port);
         host_movie.append_parameters([
@@ -501,7 +502,7 @@ impl GameRuntime {
             .record(texture_started.elapsed());
 
         self.last_error = None;
-        self.frame_metrics = FrameMetrics::default();
+        self.frame_metrics = FrameMetrics::new(source_frame_rate);
         let now = Instant::now();
         self.session = Some(EmbeddedSession {
             player,
@@ -604,7 +605,7 @@ impl GameRuntime {
                 player_tick: player_tick_elapsed,
                 render_submit: render_submit_elapsed,
                 schedule_late: due.then_some(schedule_delay),
-                frame_rate,
+                game_target_fps: frame_rate,
             },
         );
         session

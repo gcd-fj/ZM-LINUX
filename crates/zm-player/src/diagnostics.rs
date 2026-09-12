@@ -1,6 +1,7 @@
 use crate::runtime::{RuntimeEvent, RuntimeEventSender};
 use ruffle_core::backend::log::LogBackend;
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -112,7 +113,8 @@ pub(crate) struct FrameMetrics {
     queued_tasks: usize,
     peak_queue_depth: usize,
     max_single_poll: Duration,
-    frame_rate: f64,
+    source_fps: f64,
+    game_target_fps: f64,
     started_at: Option<Instant>,
 }
 
@@ -133,10 +135,17 @@ pub(crate) struct FrameUpdateTimings {
     pub(crate) player_tick: Option<Duration>,
     pub(crate) render_submit: Option<Duration>,
     pub(crate) schedule_late: Option<Duration>,
-    pub(crate) frame_rate: f64,
+    pub(crate) game_target_fps: f64,
 }
 
 impl FrameMetrics {
+    pub(crate) fn new(source_fps: f64) -> Self {
+        Self {
+            source_fps,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn record(&mut self, started_at: Instant, sample: FrameUpdateTimings) {
         self.started_at.get_or_insert(started_at);
         self.updates = self.updates.saturating_add(1);
@@ -164,8 +173,8 @@ impl FrameMetrics {
         if let Some(elapsed) = sample.schedule_late {
             self.schedule_late.record(elapsed);
         }
-        if sample.frame_rate.is_finite() && sample.frame_rate > 0.0 {
-            self.frame_rate = sample.frame_rate;
+        if sample.game_target_fps.is_finite() && sample.game_target_fps > 0.0 {
+            self.game_target_fps = sample.game_target_fps;
         }
     }
 
@@ -175,8 +184,9 @@ impl FrameMetrics {
             .map(|started| started.elapsed().as_secs_f64().max(0.001))
             .unwrap_or(1.0);
         let mut output = format!(
-            "Frames (session): source_fps={:.2} update_hz={:.2} tick_hz={:.2} updates={} ticks={} render_submissions={} (tick_hz is host tick calls, not AVM frame rate)\nLocal tasks (session): polls={} queued_tasks={} peak_queue_depth={} max_single_poll_ms={:.3} (poll budget is cooperative, not a hard limit)\n",
-            self.frame_rate,
+            "Frames (session): source_fps={:.2} game_target_fps={:.2} update_hz={:.2} tick_hz={:.2} updates={} ticks={} render_submissions={} (source_fps is the loaded SWF header; game_target_fps may change at runtime; tick_hz is host tick calls, not AVM frame rate)\nLocal tasks (session): polls={} queued_tasks={} peak_queue_depth={} max_single_poll_ms={:.3} (poll budget is cooperative, not a hard limit)\n",
+            self.source_fps,
+            self.game_target_fps,
             self.updates as f64 / elapsed_secs,
             self.ticks as f64 / elapsed_secs,
             self.updates,
@@ -250,29 +260,41 @@ pub(crate) struct CompatibilityMetrics {
     red_point_updates: std::sync::atomic::AtomicU64,
 }
 
+fn compatibility_matches(message: &str) -> [bool; 5] {
+    // Keep the original conversion: scratch buffers and uppercase prechecks
+    // regressed representative inputs in the release microbenchmark.
+    let lower = message.to_ascii_lowercase();
+    [
+        lower.contains("resourceloadcomplete") || lower.contains("loadbundleassetscomplete"),
+        lower.contains("addchild") || lower.contains("added_to_stage"),
+        lower.contains("viphandler") || lower.contains("getdailyreward"),
+        message.contains("今日奖励已领取") || lower.contains("already claimed"),
+        lower.contains("checkredpoint")
+            || lower.contains("updateredpoint")
+            || lower.contains("update_red_point"),
+    ]
+}
+
 impl CompatibilityMetrics {
     pub(crate) fn record(&self, message: &str) {
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("resourceloadcomplete") || lower.contains("loadbundleassetscomplete") {
+        let [module, mount, vip, claimed, red_point] = compatibility_matches(message);
+        if module {
             self.module_completions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if lower.contains("addchild") || lower.contains("added_to_stage") {
+        if mount {
             self.loader_mounts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if lower.contains("viphandler") || lower.contains("getdailyreward") {
+        if vip {
             self.vip_requests
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if message.contains("今日奖励已领取") || lower.contains("already claimed") {
+        if claimed {
             self.vip_claimed_replies
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if lower.contains("checkredpoint")
-            || lower.contains("updateredpoint")
-            || lower.contains("update_red_point")
-        {
+        if red_point {
             self.red_point_updates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -360,21 +382,269 @@ pub(crate) fn register_dynamic_token(message: &str, secrets: &Arc<Mutex<Vec<Stri
 }
 
 pub(crate) fn redact(value: &str, secrets: &Arc<Mutex<Vec<String>>>) -> String {
-    let mut redacted = value.to_owned();
+    let mut redacted = Cow::Borrowed(value);
     for secret in secrets
         .lock()
         .unwrap()
         .iter()
         .filter(|value| !value.is_empty())
     {
-        redacted = redacted.replace(secret, "<redacted>");
+        if let Some(first_match) = redacted.find(secret) {
+            // Reuse the first match instead of searching the unchanged prefix
+            // again. Each secret still applies to the previous replacement's
+            // output, preserving overlapping-secret and placeholder semantics.
+            let mut replaced = String::with_capacity(redacted.len());
+            replaced.push_str(&redacted[..first_match]);
+            replaced.push_str("<redacted>");
+            let rest = &redacted[first_match + secret.len()..];
+            let mut copied_to = 0;
+            for (offset, _) in rest.match_indices(secret) {
+                replaced.push_str(&rest[copied_to..offset]);
+                replaced.push_str("<redacted>");
+                copied_to = offset + secret.len();
+            }
+            replaced.push_str(&rest[copied_to..]);
+            redacted = Cow::Owned(replaced);
+        }
     }
-    redacted
+    redacted.into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the pre-optimization algorithms independent for equivalence checks
+    // and the opt-in microbenchmark below.
+    fn original_redact(value: &str, secrets: &Arc<Mutex<Vec<String>>>) -> String {
+        let mut redacted = value.to_owned();
+        for secret in secrets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|value| !value.is_empty())
+        {
+            redacted = redacted.replace(secret, "<redacted>");
+        }
+        redacted
+    }
+
+    fn original_compatibility_matches(message: &str) -> [bool; 5] {
+        let lower = message.to_ascii_lowercase();
+        [
+            lower.contains("resourceloadcomplete") || lower.contains("loadbundleassetscomplete"),
+            lower.contains("addchild") || lower.contains("added_to_stage"),
+            lower.contains("viphandler") || lower.contains("getdailyreward"),
+            message.contains("今日奖励已领取") || lower.contains("already claimed"),
+            lower.contains("checkredpoint")
+                || lower.contains("updateredpoint")
+                || lower.contains("update_red_point"),
+        ]
+    }
+
+    #[test]
+    fn redaction_matches_original_for_overlaps_unicode_and_empty_secrets() {
+        let messages = [
+            "",
+            "plain loading message",
+            "aaaa aa a",
+            "token=abcabc ab abc",
+            "令牌=测试账号🙂|secret|测试账号🙂",
+            "<redacted> redacted token",
+            "Token TOKEN token",
+        ];
+        let secret_sets = [
+            vec![],
+            vec![""],
+            vec!["missing", "also-missing"],
+            vec!["aa", "a"],
+            vec!["a", "aa"],
+            vec!["abc", "ab"],
+            vec!["ab", "abc"],
+            vec!["测试账号🙂", "secret", ""],
+            vec!["token", "redacted", "<redacted>"],
+        ];
+        for secret_set in secret_sets {
+            let secrets = Arc::new(Mutex::new(
+                secret_set.into_iter().map(str::to_owned).collect(),
+            ));
+            for message in messages {
+                assert_eq!(
+                    redact(message, &secrets),
+                    original_redact(message, &secrets)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compatibility_matches_original_case_rules_without_changing_counts() {
+        let messages = [
+            "RESOURCELOADCOMPLETE resourceLoadComplete loadBundleAssetsComplete",
+            "addChild ADDED_TO_STAGE vipHandler getDailyReward",
+            "今日奖励已领取 ALREADY CLAIMED checkRedPoint updateRedPoint UPDATE_RED_POINT",
+            "xReSoUrCeLoAdCoMpLeTex 🙂 VIPHANDLER 中文",
+            "今日奖励尚未领取 update-red-point getdailyrewards",
+            "plain loading message",
+            "",
+        ];
+        let metrics = CompatibilityMetrics::default();
+        let mut expected = [0; 5];
+        for message in messages {
+            let original = original_compatibility_matches(message);
+            assert_eq!(compatibility_matches(message), original);
+            metrics.record(message);
+            for (count, matched) in expected.iter_mut().zip(original) {
+                *count += u64::from(matched);
+            }
+        }
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            [
+                metrics.module_completions.load(Ordering::Relaxed),
+                metrics.loader_mounts.load(Ordering::Relaxed),
+                metrics.vip_requests.load(Ordering::Relaxed),
+                metrics.vip_claimed_replies.load(Ordering::Relaxed),
+                metrics.red_point_updates.load(Ordering::Relaxed),
+            ],
+            expected,
+        );
+    }
+
+    #[test]
+    fn long_messages_and_short_messages_after_them_keep_all_matches() {
+        let long_message_bytes = 16 * 1_024;
+        for length in [
+            long_message_bytes - 64,
+            long_message_bytes,
+            long_message_bytes + 1,
+        ] {
+            let message = format!("{} VIPHANDLER 今日奖励已领取", "x".repeat(length));
+            assert_eq!(
+                compatibility_matches(&message),
+                original_compatibility_matches(&message)
+            );
+        }
+        assert_eq!(compatibility_matches("plain message"), [false; 5]);
+        assert_eq!(
+            compatibility_matches("getDailyReward"),
+            [false, false, true, false, false]
+        );
+    }
+
+    #[test]
+    fn refreshed_tokens_are_registered_once_and_redacted_like_the_original() {
+        let secrets = Arc::new(Mutex::new(vec![String::new()]));
+        let message = "接受数据来自平台的token:1|account|nickname|1234567890|signature";
+        register_dynamic_token(message, &secrets);
+        register_dynamic_token(message, &secrets);
+        assert_eq!(secrets.lock().unwrap().len(), 2);
+        assert_eq!(
+            redact(message, &secrets),
+            "接受数据来自平台的token:<redacted>"
+        );
+        assert_eq!(
+            redact(message, &secrets),
+            original_redact(message, &secrets)
+        );
+    }
+
+    #[test]
+    #[ignore = "release-only synthetic comparison; run with --release --ignored --nocapture"]
+    // An explicitly requested debug run must fail instead of reporting
+    // misleading unoptimized timings; ordinary test runs skip this benchmark.
+    #[allow(clippy::assertions_on_constants)]
+    fn log_processing_microbenchmark() {
+        use std::hint::black_box;
+
+        assert!(
+            !cfg!(debug_assertions),
+            "run this microbenchmark with --release"
+        );
+
+        fn measure<T>(iterations: usize, operation: &mut impl FnMut() -> T) -> f64 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(operation());
+            }
+            started.elapsed().as_nanos() as f64 / iterations as f64
+        }
+
+        fn compare<T>(
+            label: &str,
+            iterations: usize,
+            mut original: impl FnMut() -> T,
+            mut optimized: impl FnMut() -> T,
+        ) {
+            for _ in 0..32 {
+                black_box(original());
+                black_box(optimized());
+            }
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            for round in 0..7 {
+                if round % 2 == 0 {
+                    before.push(measure(iterations, &mut original));
+                    after.push(measure(iterations, &mut optimized));
+                } else {
+                    after.push(measure(iterations, &mut optimized));
+                    before.push(measure(iterations, &mut original));
+                }
+            }
+            before.sort_by(f64::total_cmp);
+            after.sort_by(f64::total_cmp);
+            println!(
+                "{label}: iterations={iterations} original_ns_per_op={:.1} optimized_ns_per_op={:.1} optimized_over_original={:.3}",
+                before[3],
+                after[3],
+                after[3] / before[3].max(1.0),
+            );
+        }
+
+        println!(
+            "Synthetic microbenchmark only: wall time per call, seven alternating rounds, median reported. This does not measure actual game performance or allocation counts."
+        );
+        let cases = [
+            ("short_no_hit", "普通资源加载日志 frame ready".to_owned()),
+            ("short_hit", "VIPHANDLER 今日奖励已领取 token=benchmark-secret-00".to_owned()),
+            ("long_no_hit", "普通资源加载日志 frame ready | ".repeat(256)),
+            ("long_hit", "RESOURCELOADCOMPLETE VIPHANDLER 今日奖励已领取 updateRedPoint token=benchmark-secret-00 | ".repeat(128)),
+            ("oversized_hit", "VIPHANDLER token=benchmark-secret-00 | ".repeat(1_024)),
+        ];
+        for (name, message) in cases {
+            let iterations = (2_000_000 / message.len().max(1)).clamp(128, 20_000);
+            assert_eq!(
+                compatibility_matches(&message),
+                original_compatibility_matches(&message)
+            );
+            compare(
+                &format!("compatibility/{name}/bytes={}", message.len()),
+                iterations,
+                || original_compatibility_matches(black_box(&message)),
+                || compatibility_matches(black_box(&message)),
+            );
+            for secret_count in [0, 2, 20] {
+                let secrets = Arc::new(Mutex::new(
+                    (0..secret_count)
+                        .map(|index| format!("benchmark-secret-{index:02}"))
+                        .collect(),
+                ));
+                assert_eq!(
+                    redact(&message, &secrets),
+                    original_redact(&message, &secrets)
+                );
+                compare(
+                    &format!(
+                        "redact/{name}/secrets={secret_count}/bytes={}",
+                        message.len()
+                    ),
+                    iterations,
+                    || original_redact(black_box(&message), black_box(&secrets)),
+                    || redact(black_box(&message), black_box(&secrets)),
+                );
+            }
+        }
+    }
 
     #[test]
     fn non_due_updates_are_counted_without_inventing_ticks_or_renders() {
@@ -400,7 +670,7 @@ mod tests {
                         max_single_poll: Duration::from_micros(900),
                     },
                 ],
-                frame_rate: 30.0,
+                game_target_fps: 30.0,
                 ..Default::default()
             },
         );
@@ -430,7 +700,7 @@ mod tests {
                 player_tick: Some(Duration::from_millis(4)),
                 render_submit: Some(Duration::from_millis(2)),
                 schedule_late: Some(Duration::from_millis(3)),
-                frame_rate: 60.0,
+                game_target_fps: 60.0,
                 ..Default::default()
             },
         );
@@ -444,6 +714,23 @@ mod tests {
         assert!(
             summary.contains("Player schedule_late: sample_count=1 total_count=1 p50_ms=3.000")
         );
-        assert!(summary.contains("source_fps=60.00"));
+        assert!(summary.contains("game_target_fps=60.00"));
+    }
+
+    #[test]
+    fn source_frame_rate_is_not_overwritten_by_dynamic_game_target() {
+        let mut metrics = FrameMetrics::new(24.0);
+        for target in [30.0, 60.0, 125.0] {
+            metrics.record(
+                Instant::now(),
+                FrameUpdateTimings {
+                    game_target_fps: target,
+                    ..Default::default()
+                },
+            );
+            let summary = metrics.summary();
+            assert!(summary.contains("source_fps=24.00"));
+            assert!(summary.contains(&format!("game_target_fps={target:.2}")));
+        }
     }
 }

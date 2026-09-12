@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -160,6 +160,40 @@ struct TestResponses {
     requests: std::sync::atomic::AtomicUsize,
 }
 
+struct DownloadFailure {
+    error: ZmError,
+    status: Option<StatusCode>,
+    transient: bool,
+}
+
+impl DownloadFailure {
+    fn retryable(&self) -> bool {
+        match self.status {
+            Some(status) => {
+                (status == StatusCode::REQUEST_TIMEOUT || status == StatusCode::TOO_MANY_REQUESTS)
+                    || status.is_server_error()
+            }
+            None => self.transient,
+        }
+    }
+}
+
+impl From<reqwest::Error> for DownloadFailure {
+    fn from(error: reqwest::Error) -> Self {
+        Self {
+            status: error.status(),
+            transient: error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                // Truncated or compressed response bodies can surface as
+                // decode errors when reqwest collects the GET response.
+                || error.is_decode(),
+            error: ZmError::Network(error.to_string()),
+        }
+    }
+}
+
 impl OfficialAssetManager {
     pub fn new(cache_root: impl Into<PathBuf>) -> Result<Self> {
         let client = Client::builder()
@@ -212,6 +246,16 @@ impl OfficialAssetManager {
     }
 
     async fn get_bytes(&self, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
+        self.get_bytes_once(url, referer)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn get_bytes_once(
+        &self,
+        url: &str,
+        referer: Option<&str>,
+    ) -> std::result::Result<Vec<u8>, DownloadFailure> {
         let _timing = AssetTiming::new(&self.performance.network_attempt);
         #[cfg(test)]
         if let Some(responses) = &self.test_responses {
@@ -223,7 +267,12 @@ impl OfficialAssetManager {
                 .lock()
                 .await
                 .pop_front()
-                .unwrap_or_else(|| Err(ZmError::Network("测试响应已耗尽".into())));
+                .unwrap_or_else(|| Err(ZmError::Network("测试响应已耗尽".into())))
+                .map_err(|error| DownloadFailure {
+                    error,
+                    status: None,
+                    transient: true,
+                });
         }
         let mut request = self.client.get(url);
         if let Some(value) = referer {
@@ -232,13 +281,13 @@ impl OfficialAssetManager {
         let response = request
             .send()
             .await
-            .map_err(|e| ZmError::Network(e.to_string()))?
+            .map_err(DownloadFailure::from)?
             .error_for_status()
-            .map_err(|e| ZmError::Network(e.to_string()))?;
+            .map_err(DownloadFailure::from)?;
         Ok(response
             .bytes()
             .await
-            .map_err(|e| ZmError::Network(e.to_string()))?
+            .map_err(DownloadFailure::from)?
             .to_vec())
     }
 
@@ -248,10 +297,16 @@ impl OfficialAssetManager {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match self.get_runtime_bytes_once(url).await {
+            match self.get_bytes_once(url, Some(HOME_URL)).await {
                 Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
                 Ok(_) => last_error = Some("服务器返回了空资源".to_owned()),
-                Err(error) => last_error = Some(error.to_string()),
+                Err(failure) => {
+                    let retryable = failure.retryable();
+                    last_error = Some(failure.error.to_string());
+                    if !retryable {
+                        break;
+                    }
+                }
             }
             if attempt < 2 {
                 tracing::warn!(
@@ -265,10 +320,6 @@ impl OfficialAssetManager {
             "运行时资源下载失败：{}",
             last_error.unwrap_or_else(|| "未知错误".into())
         )))
-    }
-
-    async fn get_runtime_bytes_once(&self, url: &str) -> Result<Vec<u8>> {
-        self.get_bytes(url, Some(HOME_URL)).await
     }
 
     async fn runtime_resource_dir(&self, game: GameKind) -> PathBuf {
@@ -437,15 +488,19 @@ impl AssetManager for OfficialAssetManager {
             let _timing = AssetTiming::new(&self.performance.resource_lock_wait);
             resource_lock.lock_owned().await
         };
-        if local.exists() {
+        let cached = {
             let _timing = AssetTiming::new(&self.performance.runtime_cache_read);
-            let bytes = tokio::fs::read(&local)
-                .await
-                .map_err(|e| ZmError::io(&local, e))?;
-            return Ok(RuntimeAsset {
-                bytes,
-                cache_hit: true,
-            });
+            tokio::fs::read(&local).await
+        };
+        match cached {
+            Ok(bytes) => {
+                return Ok(RuntimeAsset {
+                    bytes,
+                    cache_hit: true,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ZmError::io(&local, error)),
         }
         let url = self
             .resource_roots
@@ -454,14 +509,9 @@ impl AssetManager for OfficialAssetManager {
             .join(resource)
             .map_err(|e| ZmError::Asset(e.to_string()))?;
         let bytes = self.get_runtime_bytes(url.as_str()).await?;
-        if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ZmError::io(parent, e))?;
-        }
-        atomic_cache_write(
+        let bytes = atomic_cache_write(
             &local,
-            bytes.clone(),
+            bytes,
             lifecycle,
             _resource_guard,
             self.performance.clone(),
@@ -610,14 +660,15 @@ async fn atomic_cache_write(
     lifecycle: tokio::sync::OwnedRwLockReadGuard<()>,
     guard: tokio::sync::OwnedMutexGuard<()>,
     performance: Arc<AssetPerformance>,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let _timing = AssetTiming::new(&performance.runtime_write);
         // Runtime resources are disposable cache entries. Atomic publication
         // is enough; fsync on every image and SWF delays their first display.
         let (_lifecycle, _guard) = (lifecycle, guard);
-        atomic_cache_write_sync(&path, &bytes)
+        atomic_cache_write_sync(&path, &bytes)?;
+        Ok(bytes)
     })
     .await
     .map_err(|error| ZmError::Asset(error.to_string()))?
@@ -684,7 +735,112 @@ fn sanitized_resource_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::Poll,
+    };
+
+    enum HttpReply {
+        Status(u16, &'static [u8]),
+        Truncated,
+        Stalled,
+    }
+
+    struct LocalHttpServer {
+        root: Url,
+        requests: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LocalHttpServer {
+        fn new(replies: impl IntoIterator<Item = HttpReply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let root = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_requests = requests.clone();
+            let worker_stop = stop.clone();
+            let mut replies: VecDeque<_> = replies.into_iter().collect();
+            let worker = std::thread::spawn(move || {
+                while !worker_stop.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("local HTTP accept failed: {error}"),
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    while request.len() < 16 * 1024
+                        && !request.windows(4).any(|bytes| bytes == b"\r\n\r\n")
+                    {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(length) => request.extend_from_slice(&buffer[..length]),
+                        }
+                    }
+                    worker_requests.fetch_add(1, Ordering::SeqCst);
+                    let reply = replies
+                        .pop_front()
+                        .unwrap_or(HttpReply::Status(500, b"exhausted"));
+                    let (status, body, length) = match reply {
+                        HttpReply::Status(status, body) => (status, body, body.len()),
+                        HttpReply::Truncated => (200, &b"partial"[..], 128),
+                        HttpReply::Stalled => {
+                            std::thread::sleep(Duration::from_millis(350));
+                            (200, &b"late"[..], 4)
+                        }
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    // The timeout case deliberately closes the client first.
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(body);
+                }
+            });
+            Self {
+                root,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn manager(&self, directory: &Path) -> OfficialAssetManager {
+            let mut manager = OfficialAssetManager::new(directory).unwrap();
+            manager.resource_roots = Arc::new(HashMap::from([(GameKind::Zm4, self.root.clone())]));
+            manager.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            manager
+        }
+    }
+
+    impl Drop for LocalHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 
     async fn write_manifest(manager: &OfficialAssetManager, game: GameKind, version: &str) {
         let directory = manager.game_dir(game);
@@ -971,6 +1127,194 @@ mod tests {
             .join("ui/icon.png");
         assert!(cached.is_file());
         assert!(!cached.with_extension("part").exists());
+    }
+
+    #[tokio::test]
+    async fn permanent_http_errors_fail_once_without_publishing_a_cache_entry() {
+        for status in [400, 401, 403, 404, 410] {
+            let directory = tempfile::tempdir().unwrap();
+            let server = LocalHttpServer::new([
+                HttpReply::Status(status, b"permanent"),
+                HttpReply::Status(200, b"must-not-retry"),
+            ]);
+            let manager = server.manager(directory.path());
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.fetch_resource(GameKind::Zm4, "asset.bin"),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.to_string().contains(&status.to_string()));
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+            let path = manager
+                .runtime_resource_dir(GameKind::Zm4)
+                .await
+                .join("asset.bin");
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_http_and_body_failures_retry_through_the_real_download_path() {
+        for first in [
+            HttpReply::Status(408, b"timeout"),
+            HttpReply::Status(429, b"limited"),
+            HttpReply::Status(500, b"failure"),
+            HttpReply::Status(503, b"unavailable"),
+            HttpReply::Status(200, b""),
+            HttpReply::Truncated,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let server = LocalHttpServer::new([first, HttpReply::Status(200, b"recovered")]);
+            let manager = server.manager(directory.path());
+            let asset = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.fetch_resource(GameKind::Zm4, "asset.bin"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(asset.bytes, b"recovered");
+            assert!(!asset.cache_hit);
+            let cached = manager
+                .fetch_resource(GameKind::Zm4, "asset.bin")
+                .await
+                .unwrap();
+            assert_eq!(cached.bytes, asset.bytes);
+            assert!(cached.cache_hit);
+            assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_request_timeout_retries_and_repeated_server_failure_stops_at_three() {
+        let directory = tempfile::tempdir().unwrap();
+        let server =
+            LocalHttpServer::new([HttpReply::Stalled, HttpReply::Status(200, b"recovered")]);
+        let mut manager = server.manager(directory.path());
+        manager.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let asset = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.fetch_resource(GameKind::Zm4, "timeout.bin"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(asset.bytes, b"recovered");
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+
+        let server = LocalHttpServer::new([
+            HttpReply::Status(503, b"failure"),
+            HttpReply::Status(503, b"failure"),
+            HttpReply::Status(503, b"failure"),
+            HttpReply::Status(200, b"must-not-retry"),
+        ]);
+        let manager = server.manager(directory.path());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.fetch_resource(GameKind::Zm4, "failure.bin"),
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_non_missing_cache_read_error_does_not_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, responses) =
+            OfficialAssetManager::with_test_responses(directory.path(), vec![]).unwrap();
+        let path = manager
+            .runtime_resource_dir(GameKind::Zm4)
+            .await
+            .join("is-a-directory");
+        tokio::fs::create_dir_all(&path).await.unwrap();
+        assert!(matches!(
+            manager
+                .fetch_resource(GameKind::Zm4, "is-a-directory")
+                .await,
+            Err(ZmError::Io { .. })
+        ));
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_runtime_write_returns_its_original_allocation_after_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = OfficialAssetManager::new(directory.path()).unwrap();
+        let path = directory.path().join("nested/resource.bin");
+        let bytes = vec![37_u8; 1024 * 1024];
+        let pointer = bytes.as_ptr() as usize;
+        let capacity = bytes.capacity();
+        let lifecycle = manager.lifecycle.clone().read_owned().await;
+        let guard = manager.resource_lock(&path).await.lock_owned().await;
+        let bytes = atomic_cache_write(&path, bytes, lifecycle, guard, manager.performance.clone())
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ptr() as usize, pointer);
+        assert_eq!(bytes.capacity(), capacity);
+        assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+    }
+
+    #[test]
+    fn cancelled_queued_runtime_write_finishes_before_cache_clear() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let manager = OfficialAssetManager::new(directory.path()).unwrap();
+        runtime.block_on(async {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                // Also exits if a test assertion drops the sender while unwinding.
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            });
+            ready.await.unwrap();
+            let path = manager
+                .game_dir(GameKind::Zm4)
+                .join("resources/nested/resource.bin");
+            let lifecycle = manager.lifecycle.clone().read_owned().await;
+            let guard = manager.resource_lock(&path).await.lock_owned().await;
+            let mut write = Box::pin(atomic_cache_write(
+                &path,
+                vec![17; 4096],
+                lifecycle,
+                guard,
+                manager.performance.clone(),
+            ));
+            // Poll exactly once to enqueue the blocking write behind the gate,
+            // then cancel its waiter before the write creates any directories.
+            std::future::poll_fn(|context| {
+                assert!(write.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(write);
+            assert!(manager.lifecycle.try_write().is_err());
+            let cleaner = manager.clone();
+            let clearing = tokio::spawn(async move { cleaner.clear_cache(CacheScope::All).await });
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), clearing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            blocker.await.unwrap();
+            assert!(!manager.game_dir(GameKind::Zm4).exists());
+            assert!(!path.exists());
+        });
     }
 
     #[test]
