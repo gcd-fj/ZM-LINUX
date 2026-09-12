@@ -79,6 +79,8 @@ bash tools/build-bridges.sh
 
 安装 `linuxdeploy` 后执行 `./packaging/appimage/build.sh`。产物位于 `dist/`，包含程序及校验文件，不捆绑游戏资源。
 
+预编译安装包可从 [GitHub Releases](https://github.com/gcd-fj/ZM-LINUX/releases) 下载。推送 `v` 开头的版本标签（例如 `v0.1`）后，CI 会在 Linux / Windows 检查通过后构建 AppImage，并将安装包和 SHA256 校验文件发布到对应的 GitHub Release。
+
 ## 许可
 
 项目使用 MIT，第三方来源见 [第三方说明](THIRD_PARTY_LICENSES.md)。游戏程序、资源、商标及服务属于各自权利人。

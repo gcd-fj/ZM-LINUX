@@ -34,4 +34,4 @@ if [[ -n "${APPIMAGETOOL}" ]]; then
 else
     OUTPUT="${DIST}/ZM-LINUX-x86_64.AppImage" "${LINUXDEPLOY}" --appdir "${APPDIR}" --desktop-file "${APPDIR}/usr/share/applications/io.github.gcd-fj.zm-linux.desktop" --icon-file "${APPDIR}/usr/share/icons/hicolor/512x512/apps/io.github.gcd-fj.zm-linux.png" --output appimage
 fi
-sha256sum "${DIST}/ZM-LINUX-x86_64.AppImage" > "${DIST}/ZM-LINUX-x86_64.AppImage.sha256"
+(cd "${DIST}" && sha256sum ZM-LINUX-x86_64.AppImage > ZM-LINUX-x86_64.AppImage.sha256)
