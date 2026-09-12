@@ -47,6 +47,12 @@ pub const RUFFLE_REVISION: &str = "a4f5b5256e245693bc9077ef6c6b6abc95490e7f";
 pub const GAME_WIDTH: u32 = 940;
 pub const GAME_HEIGHT: u32 = 590;
 
+/// Keep the loading movie's timeline running while dependencies are preloaded.
+/// Delayed suppresses those frames, including the game's own loading animation.
+pub const fn game_load_behavior() -> LoadBehavior {
+    LoadBehavior::Streaming
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
     HostReady,
@@ -466,7 +472,7 @@ impl GameRuntime {
             .with_ui(ZmUiBackend::new(self.fonts.clone()))
             .with_max_execution_duration(Duration::from_secs(15))
             .with_autoplay(true)
-            .with_load_behavior(LoadBehavior::Delayed)
+            .with_load_behavior(game_load_behavior())
             .with_viewport_dimensions(GAME_WIDTH, GAME_HEIGHT, 1.0)
             .with_page_url(Some("https://www.4399.com/flash/zmhj.htm".into()))
             .with_player_runtime(PlayerRuntime::FlashPlayer);
@@ -650,6 +656,12 @@ impl GameRuntime {
         self.session
             .as_ref()
             .map(|session| session.started_at.elapsed())
+    }
+
+    pub fn resource_loading_progress(&self) -> Option<crate::ResourceLoadingProgress> {
+        self.session.as_ref()?;
+        let progress = self.resource_metrics.loading_progress();
+        (progress.pending_requests > 0).then_some(progress)
     }
 
     pub fn diagnostics(&self) -> String {

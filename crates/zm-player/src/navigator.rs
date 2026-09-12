@@ -137,7 +137,11 @@ impl<N: NavigatorBackend> NavigatorBackend for ZmNavigator<N> {
             let game = self.game;
             return Box::pin(async move {
                 let started = Instant::now();
-                match assets.fetch_resource(game, &resource).await {
+                let activity = metrics.begin_load();
+                match assets
+                    .fetch_resource_with_progress(game, &resource, activity.observer())
+                    .await
+                {
                     Ok(asset) => {
                         metrics.record_success(&resource, asset.cache_hit, started.elapsed());
                         let _ = events.send(RuntimeEvent::ResourceLoaded {

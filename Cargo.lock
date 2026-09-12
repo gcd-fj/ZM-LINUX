@@ -7345,6 +7345,7 @@ dependencies = [
  "ruffle_core",
  "ruffle_frontend_utils",
  "ruffle_render_wgpu",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -41,6 +41,20 @@ pub struct RuntimeAsset {
     pub bytes: Vec<u8>,
     pub cache_hit: bool,
 }
+
+/// Actual response-body bytes received in the current download attempt.
+/// A missing total stays unknown until EOF; cache hits use attempt zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceProgress {
+    pub attempt: u8,
+    pub bytes_loaded: u64,
+    pub bytes_total: Option<u64>,
+    pub cache_hit: bool,
+}
+
+/// Observers should only forward data to a bounded queue or watch channel.
+/// They may run on any polling thread and must not execute UI work.
+pub type ResourceProgressCallback = Arc<dyn Fn(ResourceProgress) + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheScope {
     Game(GameKind),
@@ -52,6 +66,21 @@ pub trait AssetManager: Send + Sync {
     async fn resolve_version(&self, game: GameKind) -> Result<GameVersion>;
     async fn ensure_game(&self, game: GameKind) -> Result<GameAsset>;
     async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset>;
+    async fn fetch_resource_with_progress(
+        &self,
+        game: GameKind,
+        resource: &str,
+        progress: ResourceProgressCallback,
+    ) -> Result<RuntimeAsset> {
+        let asset = self.fetch_resource(game, resource).await?;
+        progress(ResourceProgress {
+            attempt: u8::from(!asset.cache_hit),
+            bytes_loaded: asset.bytes.len() as u64,
+            bytes_total: Some(asset.bytes.len() as u64),
+            cache_hit: asset.cache_hit,
+        });
+        Ok(asset)
+    }
     async fn clear_cache(&self, scope: CacheScope) -> Result<()>;
     /// Diagnostics may be unsupported by alternate managers and test doubles.
     fn performance_summary(&self) -> String {
@@ -246,7 +275,7 @@ impl OfficialAssetManager {
     }
 
     async fn get_bytes(&self, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
-        self.get_bytes_once(url, referer)
+        self.get_bytes_once(url, referer, None)
             .await
             .map_err(|failure| failure.error)
     }
@@ -255,6 +284,7 @@ impl OfficialAssetManager {
         &self,
         url: &str,
         referer: Option<&str>,
+        progress: Option<(&ResourceProgressCallback, u8)>,
     ) -> std::result::Result<Vec<u8>, DownloadFailure> {
         let _timing = AssetTiming::new(&self.performance.network_attempt);
         #[cfg(test)]
@@ -262,7 +292,7 @@ impl OfficialAssetManager {
             responses
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return responses
+            let result = responses
                 .values
                 .lock()
                 .await
@@ -273,17 +303,57 @@ impl OfficialAssetManager {
                     status: None,
                     transient: true,
                 });
+            if let (Ok(bytes), Some((callback, attempt))) = (&result, progress) {
+                callback(ResourceProgress {
+                    attempt,
+                    bytes_loaded: bytes.len() as u64,
+                    bytes_total: Some(bytes.len() as u64),
+                    cache_hit: false,
+                });
+            }
+            return result;
         }
         let mut request = self.client.get(url);
         if let Some(value) = referer {
             request = request.header("Referer", value);
         }
-        let response = request
+        let mut response = request
             .send()
             .await
             .map_err(DownloadFailure::from)?
             .error_for_status()
             .map_err(DownloadFailure::from)?;
+        if let Some((callback, attempt)) = progress {
+            let total = response.content_length();
+            callback(ResourceProgress {
+                attempt,
+                bytes_loaded: 0,
+                bytes_total: total,
+                cache_hit: false,
+            });
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(DownloadFailure::from)? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                bytes.extend_from_slice(&chunk);
+                callback(ResourceProgress {
+                    attempt,
+                    bytes_loaded: bytes.len() as u64,
+                    bytes_total: total,
+                    cache_hit: false,
+                });
+            }
+            if total != Some(bytes.len() as u64) {
+                callback(ResourceProgress {
+                    attempt,
+                    bytes_loaded: bytes.len() as u64,
+                    bytes_total: Some(bytes.len() as u64),
+                    cache_hit: false,
+                });
+            }
+            return Ok(bytes);
+        }
         Ok(response
             .bytes()
             .await
@@ -291,13 +361,32 @@ impl OfficialAssetManager {
             .to_vec())
     }
 
-    async fn get_runtime_bytes(&self, url: &str) -> Result<Vec<u8>> {
+    async fn get_runtime_bytes(
+        &self,
+        url: &str,
+        progress: Option<&ResourceProgressCallback>,
+    ) -> Result<Vec<u8>> {
         let mut last_error = None;
         for (attempt, delay_ms) in [0, 250, 750].into_iter().enumerate() {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match self.get_bytes_once(url, Some(HOME_URL)).await {
+            if let Some(callback) = progress {
+                callback(ResourceProgress {
+                    attempt: (attempt + 1) as u8,
+                    bytes_loaded: 0,
+                    bytes_total: None,
+                    cache_hit: false,
+                });
+            }
+            match self
+                .get_bytes_once(
+                    url,
+                    Some(HOME_URL),
+                    progress.map(|callback| (callback, (attempt + 1) as u8)),
+                )
+                .await
+            {
                 Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
                 Ok(_) => last_error = Some("服务器返回了空资源".to_owned()),
                 Err(failure) => {
@@ -461,6 +550,54 @@ impl AssetManager for OfficialAssetManager {
     }
 
     async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset> {
+        self.fetch_runtime_resource(game, resource, None).await
+    }
+
+    async fn fetch_resource_with_progress(
+        &self,
+        game: GameKind,
+        resource: &str,
+        progress: ResourceProgressCallback,
+    ) -> Result<RuntimeAsset> {
+        self.fetch_runtime_resource(game, resource, Some(progress))
+            .await
+    }
+
+    async fn clear_cache(&self, scope: CacheScope) -> Result<()> {
+        let _lifecycle = {
+            let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
+            self.lifecycle.write().await
+        };
+        let target = match scope {
+            CacheScope::Game(game) => {
+                self.invalidate_runtime_resource_dir(game).await;
+                self.game_dir(game)
+            }
+            CacheScope::All => {
+                self.runtime_dirs.write().await.clear();
+                self.cache_root.clone()
+            }
+        };
+        if target.exists() {
+            tokio::fs::remove_dir_all(&target)
+                .await
+                .map_err(|e| ZmError::io(&target, e))?;
+        }
+        Ok(())
+    }
+
+    fn performance_summary(&self) -> String {
+        self.performance.summary()
+    }
+}
+
+impl OfficialAssetManager {
+    async fn fetch_runtime_resource(
+        &self,
+        game: GameKind,
+        resource: &str,
+        progress: Option<ResourceProgressCallback>,
+    ) -> Result<RuntimeAsset> {
         let lifecycle = {
             let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
             self.lifecycle.clone().read_owned().await
@@ -494,6 +631,14 @@ impl AssetManager for OfficialAssetManager {
         };
         match cached {
             Ok(bytes) => {
+                if let Some(callback) = &progress {
+                    callback(ResourceProgress {
+                        attempt: 0,
+                        bytes_loaded: bytes.len() as u64,
+                        bytes_total: Some(bytes.len() as u64),
+                        cache_hit: true,
+                    });
+                }
                 return Ok(RuntimeAsset {
                     bytes,
                     cache_hit: true,
@@ -508,7 +653,9 @@ impl AssetManager for OfficialAssetManager {
             .ok_or_else(|| ZmError::Asset("缺少游戏资源根地址".into()))?
             .join(resource)
             .map_err(|e| ZmError::Asset(e.to_string()))?;
-        let bytes = self.get_runtime_bytes(url.as_str()).await?;
+        let bytes = self
+            .get_runtime_bytes(url.as_str(), progress.as_ref())
+            .await?;
         let bytes = atomic_cache_write(
             &local,
             bytes,
@@ -523,35 +670,6 @@ impl AssetManager for OfficialAssetManager {
         })
     }
 
-    async fn clear_cache(&self, scope: CacheScope) -> Result<()> {
-        let _lifecycle = {
-            let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
-            self.lifecycle.write().await
-        };
-        let target = match scope {
-            CacheScope::Game(game) => {
-                self.invalidate_runtime_resource_dir(game).await;
-                self.game_dir(game)
-            }
-            CacheScope::All => {
-                self.runtime_dirs.write().await.clear();
-                self.cache_root.clone()
-            }
-        };
-        if target.exists() {
-            tokio::fs::remove_dir_all(&target)
-                .await
-                .map_err(|e| ZmError::io(&target, e))?;
-        }
-        Ok(())
-    }
-
-    fn performance_summary(&self) -> String {
-        self.performance.summary()
-    }
-}
-
-impl OfficialAssetManager {
     async fn cached_game(&self, game: GameKind) -> Option<GameAsset> {
         let _timing = AssetTiming::new(&self.performance.cache_validation);
         let dir = self.game_dir(game);
@@ -748,6 +866,10 @@ mod tests {
         Status(u16, &'static [u8]),
         Truncated,
         Stalled,
+        Progressive {
+            known_length: bool,
+            release: std::sync::mpsc::Receiver<()>,
+        },
     }
 
     struct LocalHttpServer {
@@ -797,6 +919,28 @@ mod tests {
                     let reply = replies
                         .pop_front()
                         .unwrap_or(HttpReply::Status(500, b"exhausted"));
+                    let reply = match reply {
+                        HttpReply::Progressive {
+                            known_length,
+                            release,
+                        } => {
+                            let length = if known_length {
+                                "Content-Length: 9\r\n"
+                            } else {
+                                ""
+                            };
+                            let header =
+                                format!("HTTP/1.1 200 OK\r\n{length}Connection: close\r\n\r\n");
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(b"part");
+                            // The consumer must observe this actual network prefix
+                            // before the test allows the remaining bytes to arrive.
+                            let _ = release.recv_timeout(Duration::from_secs(5));
+                            let _ = stream.write_all(b"-done");
+                            continue;
+                        }
+                        reply => reply,
+                    };
                     let (status, body, length) = match reply {
                         HttpReply::Status(status, body) => (status, body, body.len()),
                         HttpReply::Truncated => (200, &b"partial"[..], 128),
@@ -804,6 +948,7 @@ mod tests {
                             std::thread::sleep(Duration::from_millis(350));
                             (200, &b"late"[..], 4)
                         }
+                        HttpReply::Progressive { .. } => unreachable!(),
                     };
                     let header = format!(
                         "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
@@ -840,6 +985,29 @@ mod tests {
                 let _ = worker.join();
             }
         }
+    }
+
+    type ProgressLog = Arc<StdMutex<Vec<ResourceProgress>>>;
+
+    fn observe_progress() -> (
+        ProgressLog,
+        ResourceProgressCallback,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let values = Arc::new(StdMutex::new(Vec::new()));
+        let observed = values.clone();
+        let (prefix, ready) = tokio::sync::oneshot::channel();
+        let prefix = StdMutex::new(Some(prefix));
+        let callback: ResourceProgressCallback = Arc::new(move |sample| {
+            observed.lock().unwrap().push(sample);
+            if sample.bytes_loaded == 4
+                && !sample.cache_hit
+                && let Some(prefix) = prefix.lock().unwrap().take()
+            {
+                let _ = prefix.send(());
+            }
+        });
+        (values, callback, ready)
     }
 
     async fn write_manifest(manager: &OfficialAssetManager, game: GameKind, version: &str) {
@@ -1153,6 +1321,167 @@ mod tests {
                 .join("asset.bin");
             assert!(!path.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn reports_real_http_prefix_before_completion_and_preserves_shared_cache() {
+        for known_length in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let (release, gate) = std::sync::mpsc::channel();
+            let server = LocalHttpServer::new([HttpReply::Progressive {
+                known_length,
+                release: gate,
+            }]);
+            let manager = server.manager(directory.path());
+            let (samples, callback, prefix) = observe_progress();
+            let downloader = manager.clone();
+            let downloading = tokio::spawn(async move {
+                downloader
+                    .fetch_resource_with_progress(GameKind::Zm4, "asset.bin", callback)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), prefix)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!downloading.is_finished());
+            let path = manager
+                .runtime_resource_dir(GameKind::Zm4)
+                .await
+                .join("asset.bin");
+            assert!(!path.exists());
+            assert!(samples.lock().unwrap().iter().any(|sample| {
+                sample.bytes_loaded == 4
+                    && sample.bytes_total == known_length.then_some(9)
+                    && sample.attempt == 1
+                    && !sample.cache_hit
+            }));
+
+            let (cached_samples, cached_callback, _) = observe_progress();
+            let follower = manager.clone();
+            let following = tokio::spawn(async move {
+                follower
+                    .fetch_resource_with_progress(GameKind::Zm4, "asset.bin", cached_callback)
+                    .await
+            });
+            release.send(()).unwrap();
+            let asset = tokio::time::timeout(Duration::from_secs(5), downloading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let cached = tokio::time::timeout(Duration::from_secs(5), following)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(asset.bytes, b"part-done");
+            assert!(!asset.cache_hit);
+            assert_eq!(cached.bytes, asset.bytes);
+            assert!(cached.cache_hit);
+            assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+            let samples = samples.lock().unwrap().clone();
+            assert!(
+                samples
+                    .windows(2)
+                    .all(|pair| pair[0].bytes_loaded <= pair[1].bytes_loaded)
+            );
+            assert_eq!(samples.last().unwrap().bytes_total, Some(9));
+            assert_eq!(samples.last().unwrap().bytes_loaded, 9);
+            assert_eq!(
+                *cached_samples.lock().unwrap(),
+                [ResourceProgress {
+                    attempt: 0,
+                    bytes_loaded: 9,
+                    bytes_total: Some(9),
+                    cache_hit: true,
+                }]
+            );
+            assert_eq!(tokio::fs::read(path).await.unwrap(), asset.bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_retries_reset_the_attempt_without_replaying_response_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let server =
+            LocalHttpServer::new([HttpReply::Truncated, HttpReply::Status(200, b"recovered")]);
+        let manager = server.manager(directory.path());
+        let (samples, callback, _) = observe_progress();
+        let asset = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.fetch_resource_with_progress(GameKind::Zm4, "retry.bin", callback),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(asset.bytes, b"recovered");
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+        let samples = samples.lock().unwrap().clone();
+        assert!(samples.iter().any(|sample| sample.attempt == 1));
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.attempt == 2 && sample.bytes_loaded == 0)
+        );
+        for attempt in [1, 2] {
+            let lengths: Vec<_> = samples
+                .iter()
+                .filter(|sample| sample.attempt == attempt)
+                .map(|sample| sample.bytes_loaded)
+                .collect();
+            assert!(lengths.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+        assert_eq!(samples.last().unwrap().attempt, 2);
+        assert_eq!(samples.last().unwrap().bytes_loaded, 9);
+
+        let server = LocalHttpServer::new([HttpReply::Status(404, b"missing")]);
+        let manager = server.manager(directory.path());
+        let (samples, callback, _) = observe_progress();
+        assert!(
+            manager
+                .fetch_resource_with_progress(GameKind::Zm4, "missing.bin", callback)
+                .await
+                .is_err()
+        );
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert!(
+            samples
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|sample| sample.attempt == 1 && sample.bytes_loaded == 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_progress_download_stops_callbacks_and_keeps_cache_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        let server = LocalHttpServer::new([HttpReply::Progressive {
+            known_length: true,
+            release: gate,
+        }]);
+        let manager = server.manager(directory.path());
+        let (samples, callback, prefix) = observe_progress();
+        let downloader = manager.clone();
+        let downloading = tokio::spawn(async move {
+            downloader
+                .fetch_resource_with_progress(GameKind::Zm4, "asset.bin", callback)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), prefix)
+            .await
+            .unwrap()
+            .unwrap();
+        downloading.abort();
+        assert!(downloading.await.unwrap_err().is_cancelled());
+        let observed = samples.lock().unwrap().len();
+        manager.clear_cache(CacheScope::All).await.unwrap();
+        release.send(()).unwrap();
+        drop(server);
+        assert_eq!(samples.lock().unwrap().len(), observed);
+        assert!(!manager.game_dir(GameKind::Zm4).exists());
     }
 
     #[tokio::test]

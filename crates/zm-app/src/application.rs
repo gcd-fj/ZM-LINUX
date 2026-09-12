@@ -668,9 +668,29 @@ impl eframe::App for ZmApp {
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&self.status).color(palette::MUTED));
+                        let row_height = ui.spacing().interact_size.y;
+                        ui.set_min_height(row_height);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                            if let Some(progress) = self.player.resource_loading_progress() {
+                                ui.label(format!(
+                                    "资源 {} 项待完成 · 已接收 {:.1} MiB",
+                                    progress.pending_requests,
+                                    progress.received_bytes as f64 / (1024.0 * 1024.0),
+                                ));
+                                ui.spinner();
+                            }
+                            // Keep errors and other notices visible while resources
+                            // are pending, without changing the game viewport height.
+                            ui.add_sized(
+                                [ui.available_width(), row_height],
+                                egui::Label::new(
+                                    egui::RichText::new(&self.status).color(palette::MUTED),
+                                )
+                                .truncate()
+                                .halign(egui::Align::Min),
+                            )
+                            .on_hover_text(&self.status);
                         });
                     });
                 });

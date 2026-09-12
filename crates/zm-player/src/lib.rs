@@ -4,7 +4,8 @@ mod navigator;
 mod runtime;
 mod ui_backend;
 
+pub use diagnostics::ResourceLoadingProgress;
 pub use runtime::{
     GAME_HEIGHT, GAME_WIDTH, GameFrameInput, GameRuntime, RUFFLE_REVISION, RuntimeEvent,
-    RuntimeMessage,
+    RuntimeMessage, game_load_behavior,
 };

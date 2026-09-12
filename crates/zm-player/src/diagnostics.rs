@@ -6,10 +6,69 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use zm_assets::{ResourceProgress, ResourceProgressCallback};
 use zm_core::TimingSamples;
+
+/// Resource-request activity, not the game's overall loading percentage.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLoadingProgress {
+    pub pending_requests: u64,
+    /// Actual response-body bytes received this session, including retries.
+    /// Cache hits are excluded; this is not compressed wire-traffic accounting.
+    pub received_bytes: u64,
+}
+
+#[derive(Default)]
+struct RequestProgress {
+    active: bool,
+    attempt: u8,
+    received: u64,
+}
+
+/// Ends activity even when the local AVM future is cancelled. An observer kept
+/// by a backend cannot update the counters after its request has been dropped.
+pub(crate) struct ResourceLoadGuard {
+    metrics: Arc<ResourceMetrics>,
+    state: Arc<Mutex<RequestProgress>>,
+}
+
+impl ResourceLoadGuard {
+    pub(crate) fn observer(&self) -> ResourceProgressCallback {
+        let metrics = self.metrics.clone();
+        let state = self.state.clone();
+        Arc::new(move |progress: ResourceProgress| {
+            let mut previous = state.lock().unwrap();
+            if !previous.active || progress.cache_hit || progress.attempt < previous.attempt {
+                return;
+            }
+            let baseline = if previous.attempt == progress.attempt {
+                previous.received
+            } else {
+                0
+            };
+            let current = progress.bytes_loaded.max(baseline);
+            previous.attempt = progress.attempt;
+            previous.received = current;
+            metrics
+                .received_bytes
+                .fetch_add(current - baseline, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
+}
+
+impl Drop for ResourceLoadGuard {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().active = false;
+        self.metrics
+            .pending_requests
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceMetrics {
+    pending_requests: std::sync::atomic::AtomicU64,
+    received_bytes: std::sync::atomic::AtomicU64,
     cache_hits: std::sync::atomic::AtomicU64,
     downloads: std::sync::atomic::AtomicU64,
     failures: std::sync::atomic::AtomicU64,
@@ -22,6 +81,29 @@ pub(crate) struct ResourceMetrics {
 }
 
 impl ResourceMetrics {
+    pub(crate) fn begin_load(self: &Arc<Self>) -> ResourceLoadGuard {
+        self.pending_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ResourceLoadGuard {
+            metrics: self.clone(),
+            state: Arc::new(Mutex::new(RequestProgress {
+                active: true,
+                ..Default::default()
+            })),
+        }
+    }
+
+    pub(crate) fn loading_progress(&self) -> ResourceLoadingProgress {
+        ResourceLoadingProgress {
+            pending_requests: self
+                .pending_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            received_bytes: self
+                .received_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn record_success(&self, resource: &str, cache_hit: bool, elapsed: Duration) {
         let counter = if cache_hit {
             &self.cache_hits
@@ -89,6 +171,11 @@ impl ResourceMetrics {
             average_millis(download_total, downloads),
             download_peak as f64 / 1000.0,
         );
+        let loading = self.loading_progress();
+        output.push_str(&format!(
+            "Resource transfer (session): pending_requests={} received_body_bytes={} (cache hits excluded; retries included; not overall game progress)\n",
+            loading.pending_requests, loading.received_bytes,
+        ));
         for entry in self.recent.lock().unwrap().iter() {
             output.push_str("Resource: ");
             output.push_str(entry);
@@ -413,6 +500,52 @@ pub(crate) fn redact(value: &str, secrets: &Arc<Mutex<Vec<String>>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_activity_tracks_retries_cache_hits_and_cancelled_observers() {
+        let metrics = Arc::new(ResourceMetrics::default());
+        let download = metrics.begin_load();
+        let cached = metrics.begin_load();
+        let observer = download.observer();
+        let report = |attempt, bytes_loaded| ResourceProgress {
+            attempt,
+            bytes_loaded,
+            bytes_total: None,
+            cache_hit: false,
+        };
+        observer(report(1, 4));
+        observer(report(1, 9));
+        observer(report(1, 9)); // Repeated totals must not double-count bytes.
+        observer(report(1, 4)); // Neither may an out-of-order notification.
+        observer(report(1, 9));
+        observer(report(2, 0));
+        observer(report(2, 2)); // Retried bytes were actually received again.
+        observer(report(1, 9));
+        cached.observer()(ResourceProgress {
+            cache_hit: true,
+            bytes_loaded: 1000,
+            bytes_total: Some(1000),
+            attempt: 0,
+        });
+        assert_eq!(
+            metrics.loading_progress(),
+            ResourceLoadingProgress {
+                pending_requests: 2,
+                received_bytes: 11,
+            },
+        );
+        drop(cached);
+        assert_eq!(metrics.loading_progress().pending_requests, 1);
+        drop(download); // Same drop path as a cancelled AVM future.
+        observer(report(2, 100));
+        assert_eq!(
+            metrics.loading_progress(),
+            ResourceLoadingProgress {
+                pending_requests: 0,
+                received_bytes: 11,
+            },
+        );
+    }
 
     // Keep the pre-optimization algorithms independent for equivalence checks
     // and the opt-in microbenchmark below.

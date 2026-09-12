@@ -24,4 +24,5 @@ zm-assets = { path = "../zm-assets" }
 zm-core = { path = "../zm-core" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tracing-subscriber.workspace = true
