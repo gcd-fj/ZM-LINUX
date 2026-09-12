@@ -7,7 +7,7 @@ use ruffle_core::{
     },
     font::{FontFileData, FontQuery},
 };
-use std::fs;
+use std::{fs, sync::Arc};
 use url::Url;
 
 /// 为嵌入式播放器提供系统字体和不依赖桌面窗口句柄的基础 UI 能力。
@@ -15,16 +15,13 @@ use url::Url;
 /// 文件选择和全屏由外层 egui 界面负责，因此这里保持安全的取消/空操作语义；
 /// 系统字体则必须真实接通，否则 Flash 的设备字体请求会反复失败并造成文字缺失。
 pub(crate) struct ZmUiBackend {
-    fonts: fontdb::Database,
+    fonts: Arc<fontdb::Database>,
     mouse_visible: bool,
     clipboard: String,
 }
 
 impl ZmUiBackend {
-    pub(crate) fn new() -> Self {
-        let mut fonts = fontdb::Database::new();
-        fonts.load_system_fonts();
-        tracing::info!(font_faces = fonts.faces().count(), "系统字体数据库已加载");
+    pub(crate) fn new(fonts: Arc<fontdb::Database>) -> Self {
         Self {
             fonts,
             mouse_visible: true,
@@ -200,7 +197,9 @@ impl UiBackend for ZmUiBackend {
 #[cfg(test)]
 mod tests {
     use super::ZmUiBackend;
+    use ruffle_core::backend::ui::FontDefinition;
     use ruffle_core::font::{FontQuery, FontType};
+    use std::sync::Arc;
 
     #[test]
     fn 常见_windows_字体包含_linux_回退() {
@@ -219,12 +218,35 @@ mod tests {
 
     #[test]
     fn 无系统字体时安全返回未匹配() {
-        let backend = ZmUiBackend {
-            fonts: fontdb::Database::new(),
-            mouse_visible: true,
-            clipboard: String::new(),
-        };
+        let backend = ZmUiBackend::new(Arc::new(fontdb::Database::new()));
         let query = FontQuery::new(FontType::Device, "Missing Font".into(), false, false);
         assert!(backend.find_font(&query).is_none());
+    }
+
+    #[test]
+    fn sessions_query_the_same_database_and_keep_requested_fallback_names() {
+        let builtin_fonts = egui::FontDefinitions::default();
+        let builtin = &builtin_fonts.font_data["Hack"];
+        let mut database = fontdb::Database::new();
+        database.load_font_data(builtin.font.to_vec());
+        let mut face = database.faces().next().unwrap().clone();
+        face.families = vec![(
+            "Noto Sans CJK SC".into(),
+            fontdb::Language::English_UnitedStates,
+        )];
+        database.push_face_info(face);
+        let database = Arc::new(database);
+        let first = ZmUiBackend::new(database.clone());
+        let second = ZmUiBackend::new(database.clone());
+        assert!(Arc::ptr_eq(&first.fonts, &second.fonts));
+        let query = FontQuery::new(FontType::Device, "Verdana".into(), false, false);
+        for backend in [&first, &second] {
+            let Some(FontDefinition::FontFile { name, data, .. }) = backend.find_font(&query)
+            else {
+                panic!("shared font source must satisfy the existing fallback query");
+            };
+            assert_eq!(name, "Verdana");
+            assert_eq!(&*data, builtin.font.as_ref());
+        }
     }
 }

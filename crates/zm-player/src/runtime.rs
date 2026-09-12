@@ -118,6 +118,14 @@ fn advance_frame_deadline(previous: Instant, completed_at: Instant, interval: Du
         .unwrap_or(completed_at)
 }
 
+fn validate_main_swf_header(bytes: &[u8]) -> Result<()> {
+    if matches!(bytes.get(..3), Some(b"FWS" | b"CWS" | b"ZWS")) {
+        Ok(())
+    } else {
+        Err(ZmError::Runtime("游戏主文件格式无效".into()))
+    }
+}
+
 fn configure_default_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Serif,
@@ -278,6 +286,12 @@ pub struct GameRuntime {
     repaint: egui::Context,
     events: Sender<RuntimeMessage>,
     assets: Arc<dyn AssetManager>,
+    fonts: Arc<fontdb::Database>,
+    // The render state has one fixed device/queue for this runtime's lifetime.
+    // Only device-wide pipelines are shared; each session owns its renderer and textures.
+    descriptors: Option<Arc<Descriptors>>,
+    descriptors_created: u64,
+    descriptors_reused: u64,
     session: Option<EmbeddedSession>,
     traces: Arc<Mutex<VecDeque<String>>>,
     secrets: Arc<Mutex<Vec<String>>>,
@@ -296,6 +310,7 @@ impl GameRuntime {
         events: Sender<RuntimeMessage>,
         assets: Arc<dyn AssetManager>,
         tokio: tokio::runtime::Handle,
+        fonts: Arc<fontdb::Database>,
     ) -> Self {
         Self {
             tokio,
@@ -303,6 +318,10 @@ impl GameRuntime {
             repaint,
             events,
             assets,
+            fonts,
+            descriptors: None,
+            descriptors_created: 0,
+            descriptors_reused: 0,
             session: None,
             traces: Arc::new(Mutex::new(VecDeque::with_capacity(160))),
             secrets: Arc::new(Mutex::new(Vec::new())),
@@ -330,34 +349,34 @@ impl GameRuntime {
         self.secrets = Arc::new(Mutex::new(Vec::new()));
         self.resource_metrics = Arc::new(ResourceMetrics::default());
         self.compatibility_metrics = Arc::new(CompatibilityMetrics::default());
-        let file_started = Instant::now();
-        if !request.main_swf.is_file() {
-            return Err(ZmError::Runtime("游戏主文件不存在".into()));
-        }
-        let main_swf = std::fs::read(&request.main_swf)
-            .map_err(|error| ZmError::Runtime(format!("读取游戏主文件失败：{error}")))?;
-        if !matches!(main_swf.get(..3), Some(b"FWS" | b"CWS" | b"ZWS")) {
-            return Err(ZmError::Runtime("游戏主文件格式无效".into()));
-        }
-        self.startup_metrics
-            .file_read
-            .record(file_started.elapsed());
+        // The asset manager already read and verified these bytes. Do not reopen
+        // the diagnostic path: it may have changed since launch preparation.
+        let main_swf = request.main_swf_bytes.as_ref();
+        validate_main_swf_header(main_swf)?;
         {
             let mut secrets = self.secrets.lock().unwrap();
             secrets.push(request.auth_token.clone());
             secrets.push(request.auth_cookie.clone());
         }
 
-        let descriptors_started = Instant::now();
-        let descriptors = Arc::new(Descriptors::new(
-            wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
-            self.render_state.adapter.clone(),
-            self.render_state.device.clone(),
-            self.render_state.queue.clone(),
-        ));
-        self.startup_metrics
-            .descriptors
-            .record(descriptors_started.elapsed());
+        let descriptors = if let Some(descriptors) = &self.descriptors {
+            self.descriptors_reused = self.descriptors_reused.saturating_add(1);
+            descriptors.clone()
+        } else {
+            let descriptors_started = Instant::now();
+            let descriptors = Arc::new(Descriptors::new(
+                wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
+                self.render_state.adapter.clone(),
+                self.render_state.device.clone(),
+                self.render_state.queue.clone(),
+            ));
+            self.startup_metrics
+                .descriptors
+                .record(descriptors_started.elapsed());
+            self.descriptors = Some(descriptors.clone());
+            self.descriptors_created = self.descriptors_created.saturating_add(1);
+            descriptors
+        };
         let target = EguiTextureTarget::new(&descriptors.device, GAME_WIDTH, GAME_HEIGHT);
         let renderer = WgpuRenderBackend::new(descriptors, target)
             .map_err(|error| ZmError::Runtime(format!("初始化Ruffle渲染器失败：{error}")))?;
@@ -365,8 +384,9 @@ impl GameRuntime {
         let movie_url = Url::parse(&request.movie_url)
             .map_err(|error| ZmError::Runtime(format!("游戏地址无效：{error}")))?;
         let parse_started = Instant::now();
-        let mut host_movie = SwfMovie::from_data(&main_swf, request.movie_url.clone(), None, None)
-            .map_err(|error| ZmError::Runtime(format!("游戏主文件损坏：{error}")))?;
+        let mut host_movie =
+            SwfMovie::from_data(main_swf, request.movie_url.clone(), None, None)
+                .map_err(|error| ZmError::Runtime(format!("游戏主文件损坏：{error}")))?;
         self.startup_metrics
             .movie_parse
             .record(parse_started.elapsed());
@@ -442,14 +462,7 @@ impl GameRuntime {
             .with_storage(Box::new(DiskStorageBackend::new(save_dir)))
             .with_external_interface(Box::new(external))
             .with_log(log)
-            .with_ui({
-                let font_started = Instant::now();
-                let ui = ZmUiBackend::new();
-                self.startup_metrics
-                    .font_scan
-                    .record(font_started.elapsed());
-                ui
-            })
+            .with_ui(ZmUiBackend::new(self.fonts.clone()))
             .with_max_execution_duration(Duration::from_secs(15))
             .with_autoplay(true)
             .with_load_behavior(LoadBehavior::Delayed)
@@ -675,6 +688,10 @@ impl GameRuntime {
             }
         }
         output.push_str(&self.frame_metrics.summary());
+        output.push_str(&format!(
+            "Startup shared resources: main_swf=prepared_bytes font_database=shared file_read=omitted font_scan=omitted\nGPU descriptors (runtime lifetime): created={} reused={}\n",
+            self.descriptors_created, self.descriptors_reused,
+        ));
         output.push_str(&self.startup_metrics.summary());
         output.push_str(&self.resource_metrics.summary());
         output.push_str(&self.compatibility_metrics.summary());
@@ -845,6 +862,20 @@ impl ExternalInterfaceProvider for ZmExternalInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_movie_bytes_preserve_compression_header_validation() {
+        for bytes in [b"FWS".as_slice(), b"CWS", b"ZWS"] {
+            assert!(validate_main_swf_header(bytes).is_ok());
+        }
+        for bytes in [b"".as_slice(), b"FW", b"<html>", b"fws"] {
+            assert!(validate_main_swf_header(bytes).is_err());
+        }
+        // Magic validation remains separate from the full Ruffle parse.
+        assert!(
+            SwfMovie::from_data(b"FWS", "https://example.com/game.swf".into(), None, None).is_err()
+        );
+    }
 
     #[test]
     fn redacts_complete_token() {

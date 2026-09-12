@@ -30,6 +30,8 @@ pub struct GameVersion {
 pub struct GameAsset {
     pub version: GameVersion,
     pub path: PathBuf,
+    /// The validated or freshly patched bytes, shared with the player.
+    pub main_swf_bytes: Arc<[u8]>,
     pub sha256: String,
     pub cache_hit: bool,
 }
@@ -211,6 +213,18 @@ impl OfficialAssetManager {
 
     async fn get_bytes(&self, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
         let _timing = AssetTiming::new(&self.performance.network_attempt);
+        #[cfg(test)]
+        if let Some(responses) = &self.test_responses {
+            responses
+                .requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return responses
+                .values
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| Err(ZmError::Network("测试响应已耗尽".into())));
+        }
         let mut request = self.client.get(url);
         if let Some(value) = referer {
             request = request.header("Referer", value);
@@ -254,19 +268,6 @@ impl OfficialAssetManager {
     }
 
     async fn get_runtime_bytes_once(&self, url: &str) -> Result<Vec<u8>> {
-        #[cfg(test)]
-        if let Some(responses) = &self.test_responses {
-            let _timing = AssetTiming::new(&self.performance.network_attempt);
-            responses
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return responses
-                .values
-                .lock()
-                .await
-                .pop_front()
-                .unwrap_or_else(|| Err(ZmError::Network("测试响应已耗尽".into())));
-        }
         self.get_bytes(url, Some(HOME_URL)).await
     }
 
@@ -279,17 +280,11 @@ impl OfficialAssetManager {
             .await
             .ok()
             .and_then(|raw| toml::from_str::<Manifest>(&raw).ok())
-            .map(|manifest| {
-                let version_hash = digest(manifest.version.as_bytes());
-                format!(
-                    "patch{}-{}-{}",
-                    manifest.patch_version,
-                    &version_hash[..12],
-                    &digest(manifest.bridge_sha256.as_bytes())[..12]
-                )
-            })
+            .map(|manifest| resource_namespace(&manifest))
             .unwrap_or_else(|| format!("patch{PATCH_VERSION}-unknown"));
         let directory = self.game_dir(game).join("resources").join(namespace);
+        // A concurrent publisher inserts its new namespace while switching the
+        // manifest. Prefer that entry over a manifest read started beforehand.
         self.runtime_dirs
             .write()
             .await
@@ -328,6 +323,16 @@ struct Manifest {
     movie_url: String,
     #[serde(default)]
     page_url: String,
+}
+
+fn resource_namespace(manifest: &Manifest) -> String {
+    let version_hash = digest(manifest.version.as_bytes());
+    format!(
+        "patch{}-{}-{}",
+        manifest.patch_version,
+        &version_hash[..12],
+        &digest(manifest.bridge_sha256.as_bytes())[..12]
+    )
 }
 
 #[async_trait]
@@ -383,8 +388,8 @@ impl AssetManager for OfficialAssetManager {
             let _timing = AssetTiming::new(&self.performance.resource_lock_wait);
             lock.lock_owned().await
         };
-        let previous = self.cached_game(game).await;
-        let version = match self.resolve_version(game).await {
+        let (previous, version) = tokio::join!(self.cached_game(game), self.resolve_version(game));
+        let version = match version {
             Ok(version) => version,
             Err(error) => return previous.ok_or(error),
         };
@@ -500,39 +505,43 @@ impl OfficialAssetManager {
     async fn cached_game(&self, game: GameKind) -> Option<GameAsset> {
         let _timing = AssetTiming::new(&self.performance.cache_validation);
         let dir = self.game_dir(game);
-        let raw = tokio::fs::read_to_string(dir.join("manifest.toml"))
-            .await
-            .ok()?;
-        let manifest: Manifest = toml::from_str(&raw).ok()?;
-        if manifest.patch_version != PATCH_VERSION
-            || manifest.bridge_sha256 != digest(bridge_abc(game))
-            || manifest.final_sha256.len() != 64
-            || !manifest.final_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return None;
-        }
-        let url = Url::parse(&manifest.movie_url).ok()?;
-        if url.scheme() != "https" || url.host_str() != Some("sda.4399.com") {
-            return None;
-        }
-        let path = dir
-            .join("versions")
-            .join(format!("{}.swf", manifest.final_sha256));
-        let bytes = tokio::fs::read(&path).await.ok()?;
-        if digest(&bytes) != manifest.final_sha256 {
-            return None;
-        }
-        Some(GameAsset {
-            version: GameVersion {
-                game,
-                file_name: manifest.version,
-                page_url: manifest.page_url,
-                swf_url: manifest.movie_url,
-            },
-            path,
-            sha256: manifest.final_sha256,
-            cache_hit: true,
+        tokio::task::spawn_blocking(move || {
+            let raw = std::fs::read_to_string(dir.join("manifest.toml")).ok()?;
+            let manifest: Manifest = toml::from_str(&raw).ok()?;
+            if manifest.patch_version != PATCH_VERSION
+                || manifest.bridge_sha256 != digest(bridge_abc(game))
+                || manifest.final_sha256.len() != 64
+                || !manifest.final_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            let url = Url::parse(&manifest.movie_url).ok()?;
+            if url.scheme() != "https" || url.host_str() != Some("sda.4399.com") {
+                return None;
+            }
+            let path = dir
+                .join("versions")
+                .join(format!("{}.swf", manifest.final_sha256));
+            let bytes = std::fs::read(&path).ok()?;
+            if digest(&bytes) != manifest.final_sha256 {
+                return None;
+            }
+            Some(GameAsset {
+                version: GameVersion {
+                    game,
+                    file_name: manifest.version,
+                    page_url: manifest.page_url,
+                    swf_url: manifest.movie_url,
+                },
+                path,
+                main_swf_bytes: bytes.into(),
+                sha256: manifest.final_sha256,
+                cache_hit: true,
+            })
         })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn publish_game(
@@ -545,43 +554,53 @@ impl OfficialAssetManager {
         let source = self
             .get_bytes(&version.swf_url, Some(&version.page_url))
             .await?;
-        let (raw_sha256, bytes, sha256) = {
-            let _timing = AssetTiming::new(&self.performance.swf_patch);
-            let raw_sha256 = digest(&source);
-            let bytes = swf_patch::inject_bridge(&source, bridge_abc(game), game)?;
-            let sha256 = digest(&bytes);
-            (raw_sha256, bytes, sha256)
-        };
         let dir = self.game_dir(game);
-        let path = dir.join("versions").join(format!("{sha256}.swf"));
-        // Publish the content before the pointer. Cancellation never invalidates the old pointer.
-        let raw = toml::to_string_pretty(&Manifest {
-            version: version.file_name.clone(),
-            raw_sha256,
-            bridge_sha256: digest(bridge_abc(game)),
-            final_sha256: sha256.clone(),
-            patch_version: PATCH_VERSION,
-            movie_url: version.swf_url.clone(),
-            page_url: version.page_url.clone(),
-        })
-        .map_err(|error| ZmError::Asset(error.to_string()))?;
-        let destination = path.clone();
         let performance = self.performance.clone();
+        let runtime_dirs = self.runtime_dirs.clone();
         tokio::task::spawn_blocking(move || {
-            let _timing = AssetTiming::new(&performance.main_write);
+            // Cancellation may drop the caller, but publication owns its locks
+            // through the manifest switch and in-memory namespace refresh.
             let (_lifecycle, _guard) = (lifecycle, guard);
-            atomic_write_sync(&destination, &bytes)?;
-            atomic_write_sync(&dir.join("manifest.toml"), raw.as_bytes())
+            let (raw_sha256, bytes, sha256) = {
+                let _timing = AssetTiming::new(&performance.swf_patch);
+                let raw_sha256 = digest(&source);
+                let bytes = swf_patch::inject_bridge(&source, bridge_abc(game), game)?;
+                let sha256 = digest(&bytes);
+                (raw_sha256, bytes, sha256)
+            };
+            let main_swf_bytes: Arc<[u8]> = bytes.into();
+            let path = dir.join("versions").join(format!("{sha256}.swf"));
+            let manifest = Manifest {
+                version: version.file_name.clone(),
+                raw_sha256,
+                bridge_sha256: digest(bridge_abc(game)),
+                final_sha256: sha256.clone(),
+                patch_version: PATCH_VERSION,
+                movie_url: version.swf_url.clone(),
+                page_url: version.page_url.clone(),
+            };
+            let namespace = dir.join("resources").join(resource_namespace(&manifest));
+            let raw = toml::to_string_pretty(&manifest)
+                .map_err(|error| ZmError::Asset(error.to_string()))?;
+            {
+                let _timing = AssetTiming::new(&performance.main_write);
+                // Publish content before the pointer. Readers of the namespace
+                // are excluded until the new pointer and namespace agree.
+                atomic_write_sync(&path, &main_swf_bytes)?;
+                let mut directories = runtime_dirs.blocking_write();
+                atomic_write_sync(&dir.join("manifest.toml"), raw.as_bytes())?;
+                directories.insert(game, namespace);
+            }
+            Ok(GameAsset {
+                version,
+                path,
+                main_swf_bytes,
+                sha256,
+                cache_hit: false,
+            })
         })
         .await
-        .map_err(|error| ZmError::Asset(error.to_string()))??;
-        self.invalidate_runtime_resource_dir(game).await;
-        Ok(GameAsset {
-            version,
-            path,
-            sha256,
-            cache_hit: false,
-        })
+        .map_err(|error| ZmError::Asset(error.to_string()))?
     }
 }
 
@@ -688,6 +707,61 @@ mod tests {
         manager.invalidate_runtime_resource_dir(game).await;
     }
 
+    async fn write_cached_fixture(
+        manager: &OfficialAssetManager,
+        game: GameKind,
+        version: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        write_manifest(manager, game, version).await;
+        let manifest_path = manager.game_dir(game).join("manifest.toml");
+        let mut manifest: Manifest =
+            toml::from_str(&tokio::fs::read_to_string(&manifest_path).await.unwrap()).unwrap();
+        manifest.final_sha256 = digest(bytes);
+        let path = manager
+            .game_dir(game)
+            .join("versions")
+            .join(format!("{}.swf", manifest.final_sha256));
+        atomic_write_sync(&path, bytes).unwrap();
+        atomic_write_sync(
+            &manifest_path,
+            toml::to_string(&manifest).unwrap().as_bytes(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn version_responses(game: GameKind, file_name: &str) -> Vec<Result<Vec<u8>>> {
+        vec![
+            Ok(format!("{}index.htm", game.profile().resource_root).into_bytes()),
+            Ok(format!("<param name='movie' value='{file_name}'>").into_bytes()),
+        ]
+    }
+
+    fn main_swf_fixture() -> Vec<u8> {
+        let mut body = vec![0x08, 0x00, 0x00, 0x18, 0x01, 0x00];
+        let mut symbols = vec![1, 0, 0, 0];
+        symbols.extend_from_slice(b"Main\0");
+        body.extend_from_slice(&((76_u16 << 6) | symbols.len() as u16).to_le_bytes());
+        body.extend_from_slice(&symbols);
+        body.extend_from_slice(&(1_u16 << 6).to_le_bytes());
+        body.extend_from_slice(&0_u16.to_le_bytes());
+        let mut source = b"FWS\x0a".to_vec();
+        source.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        source.extend_from_slice(&body);
+        source
+    }
+
+    async fn wait_for_published_content(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tokio::fs::try_exists(path).await.unwrap() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("publication did not reach the namespace gate");
+    }
+
     #[test]
     fn rejects_traversal() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -708,6 +782,163 @@ mod tests {
             digest(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[tokio::test]
+    async fn warm_launch_checks_version_and_keeps_verified_bytes_after_cache_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let game = GameKind::Zm4;
+        let (manager, responses) = OfficialAssetManager::with_test_responses(
+            directory.path(),
+            version_responses(game, "main.swf"),
+        )
+        .unwrap();
+        let expected = b"FWSverified-content";
+        let path = write_cached_fixture(&manager, game, "main.swf", expected).await;
+        let asset = manager.ensure_game(game).await.unwrap();
+        assert!(asset.cache_hit);
+        assert_eq!(asset.main_swf_bytes.as_ref(), expected);
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 2);
+        let clone = asset.clone();
+        assert!(Arc::ptr_eq(&asset.main_swf_bytes, &clone.main_swf_bytes));
+        manager.clear_cache(CacheScope::All).await.unwrap();
+        assert!(!path.exists());
+        assert_eq!(asset.main_swf_bytes.as_ref(), expected);
+    }
+
+    #[tokio::test]
+    async fn discovery_download_and_patch_failures_preserve_only_valid_previous_bytes() {
+        let game = GameKind::Zm4;
+        let offline = || Err(ZmError::Network("offline".into()));
+        let mut download_failure = version_responses(game, "new.swf");
+        download_failure.push(offline());
+        let mut patch_failure = version_responses(game, "new.swf");
+        patch_failure.push(Ok(b"invalid-swf".to_vec()));
+        for values in [vec![offline()], download_failure, patch_failure] {
+            let directory = tempfile::tempdir().unwrap();
+            let (manager, _) =
+                OfficialAssetManager::with_test_responses(directory.path(), values).unwrap();
+            let expected = b"FWSprevious-validated-version";
+            write_cached_fixture(&manager, game, "old.swf", expected).await;
+            let previous_namespace = manager.runtime_resource_dir(game).await;
+            let asset = manager.ensure_game(game).await.unwrap();
+            assert!(asset.cache_hit);
+            assert_eq!(asset.version.file_name, "old.swf");
+            assert_eq!(asset.main_swf_bytes.as_ref(), expected);
+            assert_eq!(manager.runtime_resource_dir(game).await, previous_namespace);
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, responses) = OfficialAssetManager::with_test_responses(
+            directory.path(),
+            vec![offline(), offline(), offline()],
+        )
+        .unwrap();
+        assert!(manager.ensure_game(game).await.is_err());
+        let path = write_cached_fixture(&manager, game, "old.swf", b"original").await;
+        tokio::fs::write(path, b"corrupt").await.unwrap();
+        assert!(manager.ensure_game(game).await.is_err());
+        write_cached_fixture(&manager, game, "old.swf", b"original").await;
+        let manifest_path = manager.game_dir(game).join("manifest.toml");
+        let mut manifest: Manifest =
+            toml::from_str(&tokio::fs::read_to_string(&manifest_path).await.unwrap()).unwrap();
+        manifest.patch_version += 1;
+        tokio::fs::write(&manifest_path, toml::to_string(&manifest).unwrap())
+            .await
+            .unwrap();
+        assert!(manager.ensure_game(game).await.is_err());
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn fresh_publication_returns_the_exact_patched_content_and_refreshes_namespace() {
+        for game in [GameKind::Zm4, GameKind::Zm5] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut responses = version_responses(game, "main.swf");
+            responses.push(Ok(main_swf_fixture()));
+            let (manager, _) =
+                OfficialAssetManager::with_test_responses(directory.path(), responses).unwrap();
+            let unknown_namespace = manager.runtime_resource_dir(game).await;
+            let asset = manager.ensure_game(game).await.unwrap();
+            assert!(!asset.cache_hit);
+            assert_eq!(
+                asset.main_swf_bytes.as_ref(),
+                tokio::fs::read(&asset.path).await.unwrap()
+            );
+            assert_eq!(asset.sha256, digest(&asset.main_swf_bytes));
+            assert_ne!(manager.runtime_resource_dir(game).await, unknown_namespace);
+            let cached = manager.cached_game(game).await.unwrap();
+            assert_eq!(cached.main_swf_bytes, asset.main_swf_bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_publisher_finishes_namespace_invalidation_before_the_next_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let game = GameKind::Zm4;
+        let source = main_swf_fixture();
+        let expected = swf_patch::inject_bridge(&source, bridge_abc(game), game).unwrap();
+        let mut values = version_responses(game, "new.swf");
+        values.push(Ok(source));
+        values.extend(version_responses(game, "new.swf"));
+        let (manager, responses) =
+            OfficialAssetManager::with_test_responses(directory.path(), values).unwrap();
+        write_cached_fixture(&manager, game, "old.swf", b"old-content").await;
+        let old_namespace = manager.runtime_resource_dir(game).await;
+        let namespace_gate = manager.runtime_dirs.write().await;
+        let content_path = manager
+            .game_dir(game)
+            .join("versions")
+            .join(format!("{}.swf", digest(&expected)));
+        let publisher = manager.clone();
+        let task = tokio::spawn(async move { publisher.ensure_game(game).await });
+        wait_for_published_content(&content_path).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(manager.lifecycle.try_write().is_err());
+        drop(namespace_gate);
+        // The detached blocking worker must finish publication before giving up
+        // its lifecycle guard, even though its launch future was cancelled.
+        drop(manager.lifecycle.write().await);
+        assert_ne!(
+            manager.runtime_dirs.read().await.get(&game),
+            Some(&old_namespace)
+        );
+        let asset = manager.ensure_game(game).await.unwrap();
+        assert!(asset.cache_hit);
+        assert_eq!(asset.main_swf_bytes.as_ref(), expected);
+        assert_eq!(responses.requests.load(Ordering::SeqCst), 5);
+        assert_ne!(manager.runtime_resource_dir(game).await, old_namespace);
+    }
+
+    #[tokio::test]
+    async fn cache_clear_waits_for_cancelled_publication_and_removes_its_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let game = GameKind::Zm4;
+        let source = main_swf_fixture();
+        let expected = swf_patch::inject_bridge(&source, bridge_abc(game), game).unwrap();
+        let mut values = version_responses(game, "new.swf");
+        values.push(Ok(source));
+        let (manager, _) =
+            OfficialAssetManager::with_test_responses(directory.path(), values).unwrap();
+        let namespace_gate = manager.runtime_dirs.write().await;
+        let content_path = manager
+            .game_dir(game)
+            .join("versions")
+            .join(format!("{}.swf", digest(&expected)));
+        let publisher = manager.clone();
+        let task = tokio::spawn(async move { publisher.ensure_game(game).await });
+        wait_for_published_content(&content_path).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let cleaner = manager.clone();
+        let clearing = tokio::spawn(async move { cleaner.clear_cache(CacheScope::All).await });
+        assert!(manager.lifecycle.try_write().is_err());
+        drop(namespace_gate);
+        clearing.await.unwrap().unwrap();
+        assert!(!content_path.exists());
+        assert!(!manager.game_dir(game).join("manifest.toml").exists());
+        assert!(manager.runtime_dirs.read().await.is_empty());
     }
 
     #[test]

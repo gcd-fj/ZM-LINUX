@@ -187,6 +187,7 @@ async fn prepare(
                     auth_cookie: session.auth_cookie,
                     storage_root: input.storage_root,
                     main_swf: asset.path,
+                    main_swf_bytes: asset.main_swf_bytes,
                     movie_url: asset.version.swf_url,
                 }),
                 account: input.account,

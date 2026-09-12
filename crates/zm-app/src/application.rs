@@ -103,12 +103,23 @@ pub(crate) struct ZmApp {
     pending_stop: Option<String>,
     ui_update_metrics: TimingSamples,
     diagnostics_cache: DiagnosticsCache,
+    font_scan_metrics: TimingSamples,
 }
 
 impl ZmApp {
     pub(crate) fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths) -> Self {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
-        configure_ui(&cc.egui_ctx);
+        let font_scan_started = Instant::now();
+        let mut fonts = fontdb::Database::new();
+        fonts.load_system_fonts();
+        let fonts = Arc::new(fonts);
+        let mut font_scan_metrics = TimingSamples::default();
+        font_scan_metrics.record(font_scan_started.elapsed());
+        tracing::info!(
+            font_faces = fonts.faces().count(),
+            "应用共享字体数据库已加载"
+        );
+        configure_ui(&cc.egui_ctx, &fonts);
         let app_icon = load_icon_texture(&cc.egui_ctx);
         let config_store = ConfigStore::new(paths.config_file());
         let (config, config_error) = match config_store.load() {
@@ -135,6 +146,7 @@ impl ZmApp {
             runtime_tx,
             assets.clone(),
             rt.handle().clone(),
+            fonts,
         );
         player.set_volume(config.volume);
         let (tx, rx) = mpsc::channel();
@@ -187,6 +199,7 @@ impl ZmApp {
             pending_stop: None,
             ui_update_metrics: TimingSamples::default(),
             diagnostics_cache: DiagnosticsCache::default(),
+            font_scan_metrics,
         };
         app.select_account(initial_mode);
         if let Some(error) = config_error {
@@ -606,6 +619,11 @@ impl ZmApp {
         }
         let mut output = self.player.diagnostics();
         output.push_str(&self.ui_update_metrics.summary("ui_update_cpu"));
+        output.push_str(
+            &self
+                .font_scan_metrics
+                .summary("App font_scan CPU wall (once)"),
+        );
         output.push_str(&self.assets.performance_summary());
         output
     }

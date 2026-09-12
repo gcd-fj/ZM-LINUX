@@ -129,10 +129,8 @@ fn configure_style(style: &mut egui::Style) {
     style.visuals.hyperlink_color = BRAND;
 }
 
-pub(crate) fn configure_ui(ctx: &egui::Context) {
+pub(crate) fn configure_ui(ctx: &egui::Context, database: &fontdb::Database) {
     let mut fonts = egui::FontDefinitions::default();
-    let mut database = fontdb::Database::new();
-    database.load_system_fonts();
     let families = [
         "Noto Sans CJK SC",
         "Noto Sans SC",

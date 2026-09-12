@@ -54,6 +54,7 @@ impl AuthClient for Auth {
 struct Assets {
     calls: AtomicUsize,
     fails: bool,
+    main_swf_bytes: Arc<[u8]>,
 }
 #[async_trait]
 impl AssetManager for Assets {
@@ -73,6 +74,7 @@ impl AssetManager for Assets {
         Ok(GameAsset {
             version: self.resolve_version(game).await?,
             path: PathBuf::from("game.swf"),
+            main_swf_bytes: self.main_swf_bytes.clone(),
             sha256: "hash".into(),
             cache_hit: false,
         })
@@ -99,6 +101,7 @@ async fn captcha_never_downloads_game_and_preserves_image_error() {
     let assets = Arc::new(Assets {
         calls: AtomicUsize::new(0),
         fails: false,
+        main_swf_bytes: Arc::from([]),
     });
     let events = Mutex::new(vec![]);
     prepare_launch(
@@ -123,6 +126,7 @@ async fn captcha_never_downloads_game_and_preserves_image_error() {
 #[tokio::test]
 async fn prepared_session_keeps_login_identity_separate_from_display_name() {
     let events = Mutex::new(vec![]);
+    let main_swf_bytes: Arc<[u8]> = Arc::from(&b"FWSvalidated-main"[..]);
     prepare_launch(
         input(),
         Arc::new(Auth {
@@ -132,6 +136,7 @@ async fn prepared_session_keeps_login_identity_separate_from_display_name() {
         Arc::new(Assets {
             calls: AtomicUsize::new(0),
             fails: false,
+            main_swf_bytes: main_swf_bytes.clone(),
         }),
         |event| events.lock().unwrap().push(event),
     )
@@ -151,6 +156,7 @@ async fn prepared_session_keeps_login_identity_separate_from_display_name() {
     assert_eq!(launch.session_id, 7);
     assert_eq!(launch.account_name, "account-login");
     assert_eq!(launch.account_display_name, "different-display-name");
+    assert!(Arc::ptr_eq(&launch.main_swf_bytes, &main_swf_bytes));
 }
 #[tokio::test]
 async fn asset_failure_never_creates_player() {
@@ -164,6 +170,7 @@ async fn asset_failure_never_creates_player() {
         Arc::new(Assets {
             calls: AtomicUsize::new(0),
             fails: true,
+            main_swf_bytes: Arc::from([]),
         }),
         |event| events.lock().unwrap().push(event),
     )

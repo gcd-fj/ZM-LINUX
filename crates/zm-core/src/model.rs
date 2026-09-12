@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,8 @@ pub struct GameLaunchRequest {
     pub auth_cookie: String,
     pub storage_root: PathBuf,
     pub main_swf: PathBuf,
+    /// 已通过缓存校验或补丁发布的主文件内容，播放器无需重新读取磁盘。
+    pub main_swf_bytes: Arc<[u8]>,
     /// 播放缓存内容时用作影片身份的官方地址。
     pub movie_url: String,
 }
