@@ -4,13 +4,13 @@ use std::{
         Arc,
         mpsc::{self, Receiver, Sender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 use zm_assets::{AssetManager, CacheScope, OfficialAssetManager};
 use zm_auth::OfficialAuthClient;
-use zm_core::{AccountMode, CredentialState, GameKind};
+use zm_core::{AccountMode, CredentialState, GameKind, TimingSamples};
 use zm_launcher::{
     LaunchController, LaunchEvent, LaunchInput, LaunchStage, StartupWatchdog, prepare_launch,
 };
@@ -99,6 +99,7 @@ pub(crate) struct ZmApp {
     last_diagnostics: Option<String>,
     startup_watchdog: StartupWatchdog,
     pending_stop: Option<String>,
+    ui_update_metrics: TimingSamples,
 }
 
 impl ZmApp {
@@ -180,6 +181,7 @@ impl ZmApp {
             last_diagnostics: None,
             startup_watchdog: StartupWatchdog::default(),
             pending_stop: None,
+            ui_update_metrics: TimingSamples::default(),
         };
         app.select_account(initial_mode, cc.egui_ctx.clone());
         if let Some(error) = config_error {
@@ -362,6 +364,7 @@ impl ZmApp {
                                 continue;
                             }
                             let game = launch.game;
+                            self.ui_update_metrics = TimingSamples::default();
                             match self.player.start(*launch) {
                                 Ok(()) => {
                                     self.launch.transition(id, LaunchStage::AwaitingHost);
@@ -546,7 +549,7 @@ impl ZmApp {
 
     fn stop_game(&mut self, status: String, open_picker: bool) {
         if self.player.is_running() {
-            self.last_diagnostics = Some(self.player.diagnostics());
+            self.last_diagnostics = Some(self.diagnostics());
         }
         self.pending_stop = None;
         self.launch.cancel();
@@ -592,18 +595,21 @@ impl ZmApp {
     }
 
     fn diagnostics(&self) -> String {
-        if self.player.is_running() {
-            self.player.diagnostics()
-        } else {
-            self.last_diagnostics
-                .clone()
-                .unwrap_or_else(|| self.player.diagnostics())
+        if !self.player.is_running()
+            && let Some(previous) = &self.last_diagnostics
+        {
+            return previous.clone();
         }
+        let mut output = self.player.diagnostics();
+        output.push_str(&self.ui_update_metrics.summary("ui_update_cpu"));
+        output.push_str(&self.assets.performance_summary());
+        output
     }
 }
 
 impl eframe::App for ZmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let update_started = Instant::now();
         if let Some(reason) = self.pending_stop.take() {
             self.stop_game(reason, false);
         }
@@ -677,6 +683,7 @@ impl eframe::App for ZmApp {
         if !self.player.is_running() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+        self.ui_update_metrics.record(update_started.elapsed());
     }
 
     fn on_exit(&mut self) {

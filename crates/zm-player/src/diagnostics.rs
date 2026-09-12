@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use zm_core::TimingSamples;
 
 #[derive(Debug, Default)]
 pub(crate) struct ResourceMetrics {
@@ -98,75 +99,137 @@ impl ResourceMetrics {
 
 #[derive(Debug, Default)]
 pub(crate) struct FrameMetrics {
-    samples: VecDeque<Duration>,
-    schedule_delays: VecDeque<Duration>,
-    rendered_frames: u64,
+    update: TimingSamples,
+    input: TimingSamples,
+    task_poll: TimingSamples,
+    player_tick: TimingSamples,
+    render_submit: TimingSamples,
+    schedule_late: TimingSamples,
+    updates: u64,
     ticks: u64,
+    render_submissions: u64,
+    task_polls: u64,
+    queued_tasks: usize,
+    peak_queue_depth: usize,
+    max_single_poll: Duration,
     frame_rate: f64,
     started_at: Option<Instant>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TaskPollReport {
+    pub(crate) elapsed: Duration,
+    pub(crate) polls: u64,
+    pub(crate) peak_queue_depth: usize,
+    pub(crate) remaining: usize,
+    pub(crate) max_single_poll: Duration,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FrameUpdateTimings {
+    pub(crate) update: Duration,
+    pub(crate) input: Duration,
+    pub(crate) tasks: [TaskPollReport; 2],
+    pub(crate) player_tick: Option<Duration>,
+    pub(crate) render_submit: Option<Duration>,
+    pub(crate) schedule_late: Option<Duration>,
+    pub(crate) frame_rate: f64,
+}
+
 impl FrameMetrics {
-    pub(crate) fn record(
-        &mut self,
-        elapsed: Duration,
-        schedule_delay: Duration,
-        rendered: bool,
-        frame_rate: f64,
-    ) {
-        self.started_at.get_or_insert_with(Instant::now);
-        if self.samples.len() >= 120 {
-            self.samples.pop_front();
+    pub(crate) fn record(&mut self, started_at: Instant, sample: FrameUpdateTimings) {
+        self.started_at.get_or_insert(started_at);
+        self.updates = self.updates.saturating_add(1);
+        self.update.record(sample.update);
+        self.input.record(sample.input);
+        self.task_poll.record(
+            sample.tasks[0]
+                .elapsed
+                .saturating_add(sample.tasks[1].elapsed),
+        );
+        for report in sample.tasks {
+            self.task_polls = self.task_polls.saturating_add(report.polls);
+            self.peak_queue_depth = self.peak_queue_depth.max(report.peak_queue_depth);
+            self.max_single_poll = self.max_single_poll.max(report.max_single_poll);
+            self.queued_tasks = report.remaining;
         }
-        self.samples.push_back(elapsed);
-        if self.schedule_delays.len() >= 120 {
-            self.schedule_delays.pop_front();
+        if let Some(elapsed) = sample.player_tick {
+            self.ticks = self.ticks.saturating_add(1);
+            self.player_tick.record(elapsed);
         }
-        self.schedule_delays.push_back(schedule_delay);
-        self.ticks += 1;
-        self.rendered_frames += u64::from(rendered);
-        if frame_rate.is_finite() && frame_rate > 0.0 {
-            self.frame_rate = frame_rate;
+        if let Some(elapsed) = sample.render_submit {
+            self.render_submissions = self.render_submissions.saturating_add(1);
+            self.render_submit.record(elapsed);
+        }
+        if let Some(elapsed) = sample.schedule_late {
+            self.schedule_late.record(elapsed);
+        }
+        if sample.frame_rate.is_finite() && sample.frame_rate > 0.0 {
+            self.frame_rate = sample.frame_rate;
         }
     }
 
     pub(crate) fn summary(&self) -> String {
-        let average_ms = if self.samples.is_empty() {
-            0.0
-        } else {
-            self.samples.iter().map(Duration::as_secs_f64).sum::<f64>() * 1000.0
-                / self.samples.len() as f64
-        };
-        let peak_ms = self
-            .samples
-            .iter()
-            .map(Duration::as_secs_f64)
-            .fold(0.0, f64::max)
-            * 1000.0;
-        let average_late_ms = if self.schedule_delays.is_empty() {
-            0.0
-        } else {
-            self.schedule_delays
-                .iter()
-                .map(Duration::as_secs_f64)
-                .sum::<f64>()
-                * 1000.0
-                / self.schedule_delays.len() as f64
-        };
-        let peak_late_ms = self
-            .schedule_delays
-            .iter()
-            .map(Duration::as_secs_f64)
-            .fold(0.0, f64::max)
-            * 1000.0;
-        let actual_fps = self
+        let elapsed_secs = self
             .started_at
-            .map(|started| self.ticks as f64 / started.elapsed().as_secs_f64().max(0.001))
-            .unwrap_or(0.0);
-        format!(
-            "Frames: source_fps={:.2} actual_fps={actual_fps:.2} ticks={} renders={} avg_tick_ms={average_ms:.2} peak_tick_ms={peak_ms:.2} avg_late_ms={average_late_ms:.2} peak_late_ms={peak_late_ms:.2}\n",
-            self.frame_rate, self.ticks, self.rendered_frames
-        )
+            .map(|started| started.elapsed().as_secs_f64().max(0.001))
+            .unwrap_or(1.0);
+        let mut output = format!(
+            "Frames (session): source_fps={:.2} update_hz={:.2} tick_hz={:.2} updates={} ticks={} render_submissions={} (tick_hz is host tick calls, not AVM frame rate)\nLocal tasks (session): polls={} queued_tasks={} peak_queue_depth={} max_single_poll_ms={:.3} (poll budget is cooperative, not a hard limit)\n",
+            self.frame_rate,
+            self.updates as f64 / elapsed_secs,
+            self.ticks as f64 / elapsed_secs,
+            self.updates,
+            self.ticks,
+            self.render_submissions,
+            self.task_polls,
+            self.queued_tasks,
+            self.peak_queue_depth,
+            self.max_single_poll.as_secs_f64() * 1_000.0,
+        );
+        for (label, samples) in [
+            ("Player update CPU wall", &self.update),
+            ("Player input CPU wall", &self.input),
+            ("Player task_poll CPU wall", &self.task_poll),
+            ("Player player_tick CPU wall", &self.player_tick),
+            (
+                "Player render_submit CPU wall (not GPU execution)",
+                &self.render_submit,
+            ),
+            ("Player schedule_late", &self.schedule_late),
+        ] {
+            output.push_str(&samples.summary(label));
+        }
+        output
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StartupMetrics {
+    pub(crate) total: TimingSamples,
+    pub(crate) file_read: TimingSamples,
+    pub(crate) descriptors: TimingSamples,
+    pub(crate) movie_parse: TimingSamples,
+    pub(crate) font_scan: TimingSamples,
+    pub(crate) player_build: TimingSamples,
+    pub(crate) texture_register: TimingSamples,
+}
+
+impl StartupMetrics {
+    pub(crate) fn summary(&self) -> String {
+        let mut output = String::new();
+        for (label, samples) in [
+            ("Startup total CPU wall", &self.total),
+            ("Startup file_read CPU wall", &self.file_read),
+            ("Startup descriptors CPU wall", &self.descriptors),
+            ("Startup movie_parse CPU wall", &self.movie_parse),
+            ("Startup font_scan CPU wall", &self.font_scan),
+            ("Startup player_build CPU wall", &self.player_build),
+            ("Startup texture_register CPU wall", &self.texture_register),
+        ] {
+            output.push_str(&samples.summary(label));
+        }
+        output
     }
 }
 
@@ -307,4 +370,80 @@ pub(crate) fn redact(value: &str, secrets: &Arc<Mutex<Vec<String>>>) -> String {
         redacted = redacted.replace(secret, "<redacted>");
     }
     redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_due_updates_are_counted_without_inventing_ticks_or_renders() {
+        let mut metrics = FrameMetrics::default();
+        metrics.record(
+            Instant::now(),
+            FrameUpdateTimings {
+                update: Duration::from_millis(5),
+                input: Duration::from_millis(1),
+                tasks: [
+                    TaskPollReport {
+                        elapsed: Duration::from_millis(1),
+                        polls: 3,
+                        peak_queue_depth: 9,
+                        remaining: 2,
+                        max_single_poll: Duration::from_micros(700),
+                    },
+                    TaskPollReport {
+                        elapsed: Duration::from_millis(2),
+                        polls: 2,
+                        peak_queue_depth: 2,
+                        remaining: 0,
+                        max_single_poll: Duration::from_micros(900),
+                    },
+                ],
+                frame_rate: 30.0,
+                ..Default::default()
+            },
+        );
+        let summary = metrics.summary();
+        assert!(summary.contains("updates=1 ticks=0 render_submissions=0"));
+        assert!(
+            summary.contains("polls=5 queued_tasks=0 peak_queue_depth=9 max_single_poll_ms=0.900")
+        );
+        assert!(summary.contains("Player update CPU wall: sample_count=1 total_count=1"));
+        assert!(
+            summary
+                .contains("Player task_poll CPU wall: sample_count=1 total_count=1 p50_ms=3.000")
+        );
+        assert!(summary.contains("Player player_tick CPU wall: sample_count=0 total_count=0"));
+        assert!(summary.contains("Player schedule_late: sample_count=0 total_count=0"));
+        assert!(!summary.contains("actual_fps="));
+    }
+
+    #[test]
+    fn due_tick_and_render_submission_have_separate_samples() {
+        let mut metrics = FrameMetrics::default();
+        metrics.record(Instant::now(), FrameUpdateTimings::default());
+        metrics.record(
+            Instant::now(),
+            FrameUpdateTimings {
+                update: Duration::from_millis(8),
+                player_tick: Some(Duration::from_millis(4)),
+                render_submit: Some(Duration::from_millis(2)),
+                schedule_late: Some(Duration::from_millis(3)),
+                frame_rate: 60.0,
+                ..Default::default()
+            },
+        );
+        let summary = metrics.summary();
+        assert!(summary.contains("updates=2 ticks=1 render_submissions=1"));
+        assert!(
+            summary
+                .contains("Player player_tick CPU wall: sample_count=1 total_count=1 p50_ms=4.000")
+        );
+        assert!(summary.contains("Player render_submit CPU wall (not GPU execution): sample_count=1 total_count=1 p50_ms=2.000"));
+        assert!(
+            summary.contains("Player schedule_late: sample_count=1 total_count=1 p50_ms=3.000")
+        );
+        assert!(summary.contains("source_fps=60.00"));
+    }
 }

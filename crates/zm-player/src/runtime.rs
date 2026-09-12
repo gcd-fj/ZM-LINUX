@@ -1,6 +1,7 @@
 use crate::{
     diagnostics::{
-        CompatibilityMetrics, FrameMetrics, RedactingLogBackend, ResourceMetrics, redact,
+        CompatibilityMetrics, FrameMetrics, FrameUpdateTimings, RedactingLogBackend,
+        ResourceMetrics, StartupMetrics, TaskPollReport, redact,
     },
     input::{event_needs_game_focus, forward_event},
     navigator::{
@@ -283,6 +284,7 @@ pub struct GameRuntime {
     last_error: Option<String>,
     volume: f32,
     frame_metrics: FrameMetrics,
+    startup_metrics: StartupMetrics,
     resource_metrics: Arc<ResourceMetrics>,
     compatibility_metrics: Arc<CompatibilityMetrics>,
 }
@@ -307,6 +309,7 @@ impl GameRuntime {
             last_error: None,
             volume: 1.0,
             frame_metrics: FrameMetrics::default(),
+            startup_metrics: StartupMetrics::default(),
             resource_metrics: Arc::new(ResourceMetrics::default()),
             compatibility_metrics: Arc::new(CompatibilityMetrics::default()),
         }
@@ -316,6 +319,8 @@ impl GameRuntime {
         let runtime = self.tokio.clone();
         let _runtime_guard = runtime.enter();
         self.stop();
+        let startup_started = Instant::now();
+        self.startup_metrics = StartupMetrics::default();
         let events = RuntimeEventSender {
             session_id: request.session_id,
             sender: self.events.clone(),
@@ -325,6 +330,7 @@ impl GameRuntime {
         self.secrets = Arc::new(Mutex::new(Vec::new()));
         self.resource_metrics = Arc::new(ResourceMetrics::default());
         self.compatibility_metrics = Arc::new(CompatibilityMetrics::default());
+        let file_started = Instant::now();
         if !request.main_swf.is_file() {
             return Err(ZmError::Runtime("游戏主文件不存在".into()));
         }
@@ -333,26 +339,37 @@ impl GameRuntime {
         if !matches!(main_swf.get(..3), Some(b"FWS" | b"CWS" | b"ZWS")) {
             return Err(ZmError::Runtime("游戏主文件格式无效".into()));
         }
+        self.startup_metrics
+            .file_read
+            .record(file_started.elapsed());
         {
             let mut secrets = self.secrets.lock().unwrap();
             secrets.push(request.auth_token.clone());
             secrets.push(request.auth_cookie.clone());
         }
 
+        let descriptors_started = Instant::now();
         let descriptors = Arc::new(Descriptors::new(
             wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
             self.render_state.adapter.clone(),
             self.render_state.device.clone(),
             self.render_state.queue.clone(),
         ));
+        self.startup_metrics
+            .descriptors
+            .record(descriptors_started.elapsed());
         let target = EguiTextureTarget::new(&descriptors.device, GAME_WIDTH, GAME_HEIGHT);
         let renderer = WgpuRenderBackend::new(descriptors, target)
             .map_err(|error| ZmError::Runtime(format!("初始化Ruffle渲染器失败：{error}")))?;
 
         let movie_url = Url::parse(&request.movie_url)
             .map_err(|error| ZmError::Runtime(format!("游戏地址无效：{error}")))?;
+        let parse_started = Instant::now();
         let mut host_movie = SwfMovie::from_data(&main_swf, request.movie_url.clone(), None, None)
             .map_err(|error| ZmError::Runtime(format!("游戏主文件损坏：{error}")))?;
+        self.startup_metrics
+            .movie_parse
+            .record(parse_started.elapsed());
         let profile = request.game.profile();
         let (server, port) = (profile.server, profile.port);
         host_movie.append_parameters([
@@ -425,7 +442,14 @@ impl GameRuntime {
             .with_storage(Box::new(DiskStorageBackend::new(save_dir)))
             .with_external_interface(Box::new(external))
             .with_log(log)
-            .with_ui(ZmUiBackend::new())
+            .with_ui({
+                let font_started = Instant::now();
+                let ui = ZmUiBackend::new();
+                self.startup_metrics
+                    .font_scan
+                    .record(font_started.elapsed());
+                ui
+            })
             .with_max_execution_duration(Duration::from_secs(15))
             .with_autoplay(true)
             .with_load_behavior(LoadBehavior::Delayed)
@@ -437,7 +461,11 @@ impl GameRuntime {
         } else {
             tracing::warn!("音频输出不可用，将以静音模式继续运行");
         }
+        let build_started = Instant::now();
         let player = builder.build();
+        self.startup_metrics
+            .player_build
+            .record(build_started.elapsed());
         let texture = {
             let mut player_guard = player.lock().unwrap();
             player_guard.set_volume(self.volume);
@@ -448,12 +476,16 @@ impl GameRuntime {
             .ok_or_else(|| ZmError::Runtime("无法取得嵌入式游戏纹理".into()))?;
             renderer.target().texture()
         };
+        let texture_started = Instant::now();
         let texture_view = texture.create_view(&Default::default());
         let texture_id = self.render_state.renderer.write().register_native_texture(
             &self.render_state.device,
             &texture_view,
             wgpu::FilterMode::Linear,
         );
+        self.startup_metrics
+            .texture_register
+            .record(texture_started.elapsed());
 
         self.last_error = None;
         self.frame_metrics = FrameMetrics::default();
@@ -471,6 +503,7 @@ impl GameRuntime {
             last_tick_at: now,
             next_tick_at: now,
         });
+        self.startup_metrics.total.record(startup_started.elapsed());
         self.repaint.request_repaint();
         tracing::info!(game = request.game.slug(), "嵌入式 Ruffle 播放器已启动");
         Ok(())
@@ -483,7 +516,8 @@ impl GameRuntime {
         let Some(session) = &mut self.session else {
             return Duration::from_millis(100);
         };
-        run_local_tasks(&session.task_queue);
+        let tasks_before = run_local_tasks(&session.task_queue);
+        let input_started = Instant::now();
         let mut player = session.player.lock().unwrap();
         if session.focused != frame.focused {
             session.focused = frame.focused;
@@ -514,15 +548,19 @@ impl GameRuntime {
             );
         }
         let now = Instant::now();
+        let input_elapsed = now.saturating_duration_since(input_started);
         let frame_rate = player.frame_rate();
         let interval = frame_interval(frame_rate);
         let due = now >= session.next_tick_at;
         let schedule_delay = now.saturating_duration_since(session.next_tick_at);
+        let mut player_tick_elapsed = None;
         if due {
             let elapsed = now
                 .saturating_duration_since(session.last_tick_at)
                 .min(Duration::from_millis(250));
+            let player_tick_started = Instant::now();
             player.tick(FloatDuration::from_millis(elapsed.as_secs_f64() * 1000.0));
+            player_tick_elapsed = Some(player_tick_started.elapsed());
             session.last_tick_at = now;
             session.next_tick_at = advance_frame_deadline(
                 session.next_tick_at,
@@ -531,20 +569,31 @@ impl GameRuntime {
             );
         }
         let rendered = should_submit_render(due, player.needs_render());
+        let mut render_submit_elapsed = None;
         if rendered {
+            let render_started = Instant::now();
             player.render();
+            render_submit_elapsed = Some(render_started.elapsed());
         }
         let frame_rate = player.frame_rate();
         drop(player);
-        run_local_tasks(&session.task_queue);
+        let tasks_after = run_local_tasks(&session.task_queue);
         session
             .tasks
             .borrow_mut()
             .retain(|task| !task.is_finished());
-        if due {
-            self.frame_metrics
-                .record(tick_started.elapsed(), schedule_delay, rendered, frame_rate);
-        }
+        self.frame_metrics.record(
+            tick_started,
+            FrameUpdateTimings {
+                update: tick_started.elapsed(),
+                input: input_elapsed,
+                tasks: [tasks_before, tasks_after],
+                player_tick: player_tick_elapsed,
+                render_submit: render_submit_elapsed,
+                schedule_late: due.then_some(schedule_delay),
+                frame_rate,
+            },
+        );
         session
             .next_tick_at
             .saturating_duration_since(Instant::now())
@@ -626,6 +675,7 @@ impl GameRuntime {
             }
         }
         output.push_str(&self.frame_metrics.summary());
+        output.push_str(&self.startup_metrics.summary());
         output.push_str(&self.resource_metrics.summary());
         output.push_str(&self.compatibility_metrics.summary());
         output.push_str("Recent sanitized AVM log:\n");
@@ -672,17 +722,30 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for LocalSpawner {
     }
 }
 
-fn run_local_tasks(queue: &TaskQueue) {
+fn run_local_tasks(queue: &TaskQueue) -> TaskPollReport {
     let started = Instant::now();
+    let mut report = TaskPollReport::default();
     for _ in 0..512 {
         if started.elapsed() >= Duration::from_millis(4) {
             break;
         }
-        let Some(runnable) = queue.lock().unwrap().pop_front() else {
+        let runnable = {
+            let mut queue = queue.lock().unwrap();
+            report.peak_queue_depth = report.peak_queue_depth.max(queue.len());
+            queue.pop_front()
+        };
+        let Some(runnable) = runnable else {
             break;
         };
+        let poll_started = Instant::now();
         runnable.run();
+        report.polls += 1;
+        report.max_single_poll = report.max_single_poll.max(poll_started.elapsed());
     }
+    report.remaining = queue.lock().unwrap().len();
+    report.peak_queue_depth = report.peak_queue_depth.max(report.remaining);
+    report.elapsed = started.elapsed();
+    report
 }
 
 struct ZmExternalInterface {
@@ -896,7 +959,10 @@ mod tests {
             Ok(())
         });
         spawner.spawn(future);
-        run_local_tasks(&queue);
+        let report = run_local_tasks(&queue);
+        assert_eq!(report.polls, 1);
+        assert_eq!(report.peak_queue_depth, 1);
+        assert_eq!(report.remaining, 0);
         assert!(!dropped.load(Ordering::SeqCst));
         tasks.borrow_mut().clear();
         run_local_tasks(&queue);

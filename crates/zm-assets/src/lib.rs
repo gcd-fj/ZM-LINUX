@@ -6,11 +6,11 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Weak},
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex, Weak},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
-use zm_core::{GameKind, Result, ZmError};
+use zm_core::{GameKind, Result, TimingSamples, ZmError};
 
 mod swf_patch;
 
@@ -51,6 +51,92 @@ pub trait AssetManager: Send + Sync {
     async fn ensure_game(&self, game: GameKind) -> Result<GameAsset>;
     async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset>;
     async fn clear_cache(&self, scope: CacheScope) -> Result<()>;
+    /// Diagnostics may be unsupported by alternate managers and test doubles.
+    fn performance_summary(&self) -> String {
+        String::new()
+    }
+}
+
+/// Bounded samples shared by manager clones, across games and launch sessions.
+#[derive(Default)]
+struct AssetPerformance {
+    cache_validation: AssetSamples,
+    lifecycle_wait: AssetSamples,
+    resource_registry_wait: AssetSamples,
+    resource_lock_wait: AssetSamples,
+    version_lookup: AssetSamples,
+    network_attempt: AssetSamples,
+    swf_patch: AssetSamples,
+    main_write: AssetSamples,
+    runtime_write: AssetSamples,
+    runtime_cache_read: AssetSamples,
+}
+
+#[derive(Default)]
+struct AssetSamples(StdMutex<TimingSamples>);
+
+impl AssetSamples {
+    fn record(&self, elapsed: Duration) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(elapsed);
+    }
+
+    fn summary(&self, label: &str) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .summary(label)
+    }
+}
+
+impl AssetPerformance {
+    fn summary(&self) -> String {
+        let mut output = String::from(
+            "Asset performance (manager lifetime; both games; failed/cancelled attempts included):\n",
+        );
+        for (label, samples) in [
+            ("Asset cache validation", &self.cache_validation),
+            ("Asset lifecycle lock wait", &self.lifecycle_wait),
+            (
+                "Asset resource registry lock wait",
+                &self.resource_registry_wait,
+            ),
+            ("Asset resource lock wait", &self.resource_lock_wait),
+            ("Asset version lookup", &self.version_lookup),
+            ("Asset network attempt", &self.network_attempt),
+            ("Asset SWF patch and hashes", &self.swf_patch),
+            ("Asset main write worker", &self.main_write),
+            ("Asset runtime write worker", &self.runtime_write),
+            ("Asset runtime cache read", &self.runtime_cache_read),
+        ] {
+            output.push_str(samples.summary(label).trim_end());
+            output.push('\n');
+        }
+        output
+    }
+}
+
+/// Record early errors and cancelled waits as well as successful operations.
+struct AssetTiming<'a> {
+    samples: &'a AssetSamples,
+    started: Instant,
+}
+
+impl<'a> AssetTiming<'a> {
+    fn new(samples: &'a AssetSamples) -> Self {
+        Self {
+            samples,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for AssetTiming<'_> {
+    fn drop(&mut self) {
+        self.samples.record(self.started.elapsed());
+    }
 }
 
 #[derive(Clone)]
@@ -61,6 +147,7 @@ pub struct OfficialAssetManager {
     in_flight: Arc<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
     runtime_dirs: Arc<RwLock<HashMap<GameKind, PathBuf>>>,
     resource_roots: Arc<HashMap<GameKind, Url>>,
+    performance: Arc<AssetPerformance>,
     #[cfg(test)]
     test_responses: Option<Arc<TestResponses>>,
 }
@@ -85,6 +172,7 @@ impl OfficialAssetManager {
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             runtime_dirs: Arc::new(RwLock::new(HashMap::new())),
             resource_roots: Arc::new(Self::default_resource_roots()),
+            performance: Arc::new(AssetPerformance::default()),
             #[cfg(test)]
             test_responses: None,
         })
@@ -122,6 +210,7 @@ impl OfficialAssetManager {
     }
 
     async fn get_bytes(&self, url: &str, referer: Option<&str>) -> Result<Vec<u8>> {
+        let _timing = AssetTiming::new(&self.performance.network_attempt);
         let mut request = self.client.get(url);
         if let Some(value) = referer {
             request = request.header("Referer", value);
@@ -167,6 +256,7 @@ impl OfficialAssetManager {
     async fn get_runtime_bytes_once(&self, url: &str) -> Result<Vec<u8>> {
         #[cfg(test)]
         if let Some(responses) = &self.test_responses {
+            let _timing = AssetTiming::new(&self.performance.network_attempt);
             responses
                 .requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -213,7 +303,10 @@ impl OfficialAssetManager {
     }
 
     async fn resource_lock(&self, path: &Path) -> Arc<Mutex<()>> {
-        let mut locks = self.in_flight.lock().await;
+        let mut locks = {
+            let _timing = AssetTiming::new(&self.performance.resource_registry_wait);
+            self.in_flight.lock().await
+        };
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
             return lock;
@@ -240,6 +333,7 @@ struct Manifest {
 #[async_trait]
 impl AssetManager for OfficialAssetManager {
     async fn resolve_version(&self, game: GameKind) -> Result<GameVersion> {
+        let _timing = AssetTiming::new(&self.performance.version_lookup);
         let landing_url = Self::standalone_url(game);
         let landing = String::from_utf8_lossy(&self.get_bytes(&landing_url, Some(HOME_URL)).await?)
             .into_owned();
@@ -278,11 +372,17 @@ impl AssetManager for OfficialAssetManager {
     }
 
     async fn ensure_game(&self, game: GameKind) -> Result<GameAsset> {
-        let lifecycle = self.lifecycle.clone().read_owned().await;
+        let lifecycle = {
+            let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
+            self.lifecycle.clone().read_owned().await
+        };
         let lock = self
             .resource_lock(&self.game_dir(game).join("manifest.toml"))
             .await;
-        let guard = lock.lock_owned().await;
+        let guard = {
+            let _timing = AssetTiming::new(&self.performance.resource_lock_wait);
+            lock.lock_owned().await
+        };
         let previous = self.cached_game(game).await;
         let version = match self.resolve_version(game).await {
             Ok(version) => version,
@@ -305,7 +405,10 @@ impl AssetManager for OfficialAssetManager {
     }
 
     async fn fetch_resource(&self, game: GameKind, resource: &str) -> Result<RuntimeAsset> {
-        let lifecycle = self.lifecycle.clone().read_owned().await;
+        let lifecycle = {
+            let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
+            self.lifecycle.clone().read_owned().await
+        };
         let resource = resource
             .split('?')
             .next()
@@ -325,8 +428,12 @@ impl AssetManager for OfficialAssetManager {
         }
         let local = self.runtime_resource_dir(game).await.join(path);
         let resource_lock = self.resource_lock(&local).await;
-        let _resource_guard = resource_lock.lock_owned().await;
+        let _resource_guard = {
+            let _timing = AssetTiming::new(&self.performance.resource_lock_wait);
+            resource_lock.lock_owned().await
+        };
         if local.exists() {
+            let _timing = AssetTiming::new(&self.performance.runtime_cache_read);
             let bytes = tokio::fs::read(&local)
                 .await
                 .map_err(|e| ZmError::io(&local, e))?;
@@ -347,7 +454,14 @@ impl AssetManager for OfficialAssetManager {
                 .await
                 .map_err(|e| ZmError::io(parent, e))?;
         }
-        atomic_cache_write(&local, bytes.clone(), lifecycle, _resource_guard).await?;
+        atomic_cache_write(
+            &local,
+            bytes.clone(),
+            lifecycle,
+            _resource_guard,
+            self.performance.clone(),
+        )
+        .await?;
         Ok(RuntimeAsset {
             bytes,
             cache_hit: false,
@@ -355,7 +469,10 @@ impl AssetManager for OfficialAssetManager {
     }
 
     async fn clear_cache(&self, scope: CacheScope) -> Result<()> {
-        let _lifecycle = self.lifecycle.write().await;
+        let _lifecycle = {
+            let _timing = AssetTiming::new(&self.performance.lifecycle_wait);
+            self.lifecycle.write().await
+        };
         let target = match scope {
             CacheScope::Game(game) => {
                 self.invalidate_runtime_resource_dir(game).await;
@@ -373,10 +490,15 @@ impl AssetManager for OfficialAssetManager {
         }
         Ok(())
     }
+
+    fn performance_summary(&self) -> String {
+        self.performance.summary()
+    }
 }
 
 impl OfficialAssetManager {
     async fn cached_game(&self, game: GameKind) -> Option<GameAsset> {
+        let _timing = AssetTiming::new(&self.performance.cache_validation);
         let dir = self.game_dir(game);
         let raw = tokio::fs::read_to_string(dir.join("manifest.toml"))
             .await
@@ -423,9 +545,13 @@ impl OfficialAssetManager {
         let source = self
             .get_bytes(&version.swf_url, Some(&version.page_url))
             .await?;
-        let raw_sha256 = digest(&source);
-        let bytes = swf_patch::inject_bridge(&source, bridge_abc(game), game)?;
-        let sha256 = digest(&bytes);
+        let (raw_sha256, bytes, sha256) = {
+            let _timing = AssetTiming::new(&self.performance.swf_patch);
+            let raw_sha256 = digest(&source);
+            let bytes = swf_patch::inject_bridge(&source, bridge_abc(game), game)?;
+            let sha256 = digest(&bytes);
+            (raw_sha256, bytes, sha256)
+        };
         let dir = self.game_dir(game);
         let path = dir.join("versions").join(format!("{sha256}.swf"));
         // Publish the content before the pointer. Cancellation never invalidates the old pointer.
@@ -440,7 +566,9 @@ impl OfficialAssetManager {
         })
         .map_err(|error| ZmError::Asset(error.to_string()))?;
         let destination = path.clone();
+        let performance = self.performance.clone();
         tokio::task::spawn_blocking(move || {
+            let _timing = AssetTiming::new(&performance.main_write);
             let (_lifecycle, _guard) = (lifecycle, guard);
             atomic_write_sync(&destination, &bytes)?;
             atomic_write_sync(&dir.join("manifest.toml"), raw.as_bytes())
@@ -462,9 +590,11 @@ async fn atomic_cache_write(
     bytes: Vec<u8>,
     lifecycle: tokio::sync::OwnedRwLockReadGuard<()>,
     guard: tokio::sync::OwnedMutexGuard<()>,
+    performance: Arc<AssetPerformance>,
 ) -> Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
+        let _timing = AssetTiming::new(&performance.runtime_write);
         // Runtime resources are disposable cache entries. Atomic publication
         // is enough; fsync on every image and SWF delays their first display.
         let (_lifecycle, _guard) = (lifecycle, guard);
@@ -634,6 +764,34 @@ mod tests {
         assert_eq!(first.bytes, second.bytes);
         assert_ne!(first.cache_hit, second.cache_hit);
         assert_eq!(responses.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn performance_samples_are_shared_across_clones_and_cache_clears() {
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, _) = OfficialAssetManager::with_test_responses(
+            directory.path(),
+            vec![Ok(b"runtime-asset".to_vec())],
+        )
+        .unwrap();
+        let before = manager.performance.network_attempt.summary("network");
+        let clone = manager.clone();
+        clone
+            .fetch_resource(GameKind::Zm4, "private-resource-name.png")
+            .await
+            .unwrap();
+        let after = manager.performance.network_attempt.summary("network");
+        assert_ne!(before, after);
+        manager.clear_cache(CacheScope::All).await.unwrap();
+        assert_eq!(
+            after,
+            manager.performance.network_attempt.summary("network")
+        );
+
+        let summary = manager.performance_summary();
+        assert!(summary.contains("manager lifetime; both games"));
+        assert!(summary.contains("Asset runtime write worker"));
+        assert!(!summary.contains("private-resource-name"));
     }
 
     #[test]
