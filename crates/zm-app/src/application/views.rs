@@ -82,6 +82,7 @@ impl ZmApp {
                             }
                             if ui.button("诊断").clicked() {
                                 self.diagnostics_open = true;
+                                self.diagnostics_cache.invalidate();
                             }
                             if ui.button("切换账号").clicked() {
                                 self.confirm_switch = true;
@@ -131,6 +132,7 @@ impl ZmApp {
             .changed()
         {
             self.player.set_volume(self.config.volume);
+            self.diagnostics_cache.invalidate();
         }
         ui.label(format!("缓存目录：{}", self.paths.cache_dir.display()));
         ui.label(format!("日志目录：{}", self.paths.log_dir.display()));
@@ -154,7 +156,6 @@ impl ZmApp {
         if ui.button("清空全部游戏缓存").clicked() {
             let assets = self.assets.clone();
             let tx = self.tx.clone();
-            let ctx = ui.ctx().clone();
             self.rt.spawn(async move {
                 let result = assets.clear_cache(CacheScope::All).await;
                 let _ = tx.send(
@@ -164,21 +165,24 @@ impl ZmApp {
                             AppMessage::Notice(format!("清理缓存失败：{error}"))
                         }),
                 );
-                ctx.request_repaint();
             });
         }
         if let AccountMode::Saved(id) = self.account_mode
             && ui.button("删除当前保存的账号").clicked()
         {
-            self.delete_managed_account(id, ui.ctx().clone());
+            self.delete_managed_account(id);
         }
         ui.separator();
-        let diagnostics = self.diagnostics();
+        self.refresh_diagnostics(false);
         egui::ScrollArea::vertical()
             .max_height(160.0)
-            .show(ui, |ui| ui.monospace(&diagnostics));
+            .show(ui, |ui| ui.monospace(&self.diagnostics_cache.text));
+        if ui.button("刷新诊断信息").clicked() {
+            self.refresh_diagnostics(true);
+        }
         if ui.button("复制诊断信息").clicked() {
-            ui.ctx().copy_text(diagnostics);
+            self.refresh_diagnostics(true);
+            ui.ctx().copy_text(self.diagnostics_cache.text.clone());
             self.status = "诊断信息已复制".into();
         }
         if ui.button("返回登录页").clicked() {
@@ -369,13 +373,13 @@ impl ZmApp {
             });
         self.account_picker_open = open;
         if let Some(id) = deletion {
-            self.delete_managed_account(id, ctx.clone());
+            self.delete_managed_account(id);
         }
         if let Some(mode) = selection {
-            self.select_account(mode, ctx.clone());
+            self.select_account(mode);
             self.status = "用户已切换".into();
         } else if add_requested {
-            self.add_managed_account(ctx.clone());
+            self.add_managed_account();
         }
     }
 
@@ -412,17 +416,30 @@ impl ZmApp {
         if !self.diagnostics_open {
             return;
         }
-        let diagnostics = self.diagnostics();
+        self.refresh_diagnostics(false);
+        let mut refresh = false;
+        let mut copy = false;
         egui::Window::new("诊断信息")
             .open(&mut self.diagnostics_open)
             .default_width(640.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .max_height(360.0)
-                    .show(ui, |ui| ui.monospace(&diagnostics));
-                if ui.button("复制").clicked() {
-                    ui.ctx().copy_text(diagnostics.clone());
-                }
+                    .show(ui, |ui| ui.monospace(&self.diagnostics_cache.text));
+                ui.horizontal(|ui| {
+                    refresh = ui.button("刷新").clicked();
+                    copy = ui.button("复制").clicked();
+                });
             });
+        if refresh || copy {
+            self.refresh_diagnostics(true);
+            if copy {
+                ctx.copy_text(self.diagnostics_cache.text.clone());
+            }
+            ctx.request_repaint();
+        }
+        if self.diagnostics_open && self.player.is_running() {
+            ctx.request_repaint_after(self.diagnostics_cache.next_refresh_in(Instant::now()));
+        }
     }
 }

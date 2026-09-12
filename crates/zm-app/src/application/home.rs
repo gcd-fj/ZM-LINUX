@@ -824,7 +824,7 @@ fn primary_action(
 }
 
 impl ZmApp {
-    pub(super) fn login_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    pub(super) fn login_ui(&mut self, ui: &mut egui::Ui) {
         paint_home_atmosphere(ui);
         let outer_width = ui.available_width();
         let content_width = content_width(outer_width);
@@ -838,8 +838,8 @@ impl ZmApp {
                 self.home_header(ui);
                 ui.add_space(palette::spacing::LG);
                 match layout {
-                    LayoutClass::Wide => self.wide_home(ui, ctx, content_width),
-                    LayoutClass::Compact => self.compact_home(ui, ctx),
+                    LayoutClass::Wide => self.wide_home(ui, content_width),
+                    LayoutClass::Compact => self.compact_home(ui),
                 }
                 ui.add_space(palette::spacing::LG);
             });
@@ -877,6 +877,7 @@ impl ZmApp {
                     };
                     if ui.add(header_button("设置")).clicked() {
                         self.page = Page::Settings;
+                        self.diagnostics_cache.invalidate();
                     }
                     if ui.add(header_button("账号管理")).clicked() {
                         self.account_picker_open = true;
@@ -886,7 +887,7 @@ impl ZmApp {
         );
     }
 
-    fn wide_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, width: f32) {
+    fn wide_home(&mut self, ui: &mut egui::Ui, width: f32) {
         let columns = wide_columns(width);
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = COLUMN_GAP;
@@ -898,15 +899,15 @@ impl ZmApp {
             ui.allocate_ui_with_layout(
                 Vec2::new(columns.launch, WIDE_HOME_HEIGHT),
                 egui::Layout::top_down(egui::Align::Min),
-                |ui| self.launch_panel(ui, ctx, Some(WIDE_HOME_HEIGHT)),
+                |ui| self.launch_panel(ui, Some(WIDE_HOME_HEIGHT)),
             );
         });
     }
 
-    fn compact_home(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn compact_home(&mut self, ui: &mut egui::Ui) {
         self.game_stage(ui, COMPACT_STAGE_HEIGHT);
         ui.add_space(palette::spacing::LG);
-        self.launch_panel(ui, ctx, None);
+        self.launch_panel(ui, None);
     }
 
     fn game_stage(&mut self, ui: &mut egui::Ui, height: f32) {
@@ -921,7 +922,7 @@ impl ZmApp {
         }
     }
 
-    fn launch_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: Option<f32>) {
+    fn launch_panel(&mut self, ui: &mut egui::Ui, height: Option<f32>) {
         let presentation = GamePresentation::for_game(self.selected_game);
         if let Some(height) = height {
             let shadow_rect =
@@ -975,7 +976,7 @@ impl ZmApp {
                     self.captcha_value.clear();
                 }
                 if self.captcha_id.is_some() {
-                    self.captcha_ui(ui, ctx);
+                    self.captcha_ui(ui);
                 }
                 self.security_settings_ui(ui, presentation);
 
@@ -1001,7 +1002,7 @@ impl ZmApp {
                     ready,
                 );
                 if action.clicked() {
-                    self.begin_login(self.selected_game, ctx.clone());
+                    self.begin_login(self.selected_game);
                 }
                 ui.add_space(palette::spacing::XS);
                 ui.vertical_centered(|ui| {
@@ -1023,7 +1024,7 @@ impl ZmApp {
         );
     }
 
-    fn captcha_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn captcha_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new("图形验证码")
                 .size(12.0)
@@ -1045,7 +1046,7 @@ impl ZmApp {
                 ui.label(egui::RichText::new("图片未加载").small());
             }
             if ui.small_button("刷新").clicked() {
-                self.refresh_captcha(ctx.clone());
+                self.refresh_captcha();
             }
         });
     }

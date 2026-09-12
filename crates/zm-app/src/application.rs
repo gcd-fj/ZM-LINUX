@@ -2,7 +2,7 @@ use eframe::egui;
 use std::{
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
 };
@@ -30,7 +30,9 @@ use crate::{
 const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(90);
 mod accounts;
 mod home;
+mod refresh;
 mod views;
+use refresh::{AppSender, DiagnosticsCache};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Login,
@@ -69,7 +71,7 @@ pub(crate) struct ZmApp {
     player: GameRuntime,
     runtime_rx: Receiver<RuntimeMessage>,
     credentials: CredentialService,
-    tx: Sender<AppMessage>,
+    tx: AppSender,
     rx: Receiver<AppMessage>,
     page: Page,
     account_mode: AccountMode,
@@ -100,6 +102,7 @@ pub(crate) struct ZmApp {
     startup_watchdog: StartupWatchdog,
     pending_stop: Option<String>,
     ui_update_metrics: TimingSamples,
+    diagnostics_cache: DiagnosticsCache,
 }
 
 impl ZmApp {
@@ -135,6 +138,7 @@ impl ZmApp {
         );
         player.set_volume(config.volume);
         let (tx, rx) = mpsc::channel();
+        let tx = AppSender::new(tx, cc.egui_ctx.clone());
         let initial_mode = config
             .last_account
             .filter(|id| config.accounts.iter().any(|account| account.id == *id))
@@ -182,15 +186,16 @@ impl ZmApp {
             startup_watchdog: StartupWatchdog::default(),
             pending_stop: None,
             ui_update_metrics: TimingSamples::default(),
+            diagnostics_cache: DiagnosticsCache::default(),
         };
-        app.select_account(initial_mode, cc.egui_ctx.clone());
+        app.select_account(initial_mode);
         if let Some(error) = config_error {
             app.status = error;
         }
         app
     }
 
-    fn select_account(&mut self, mode: AccountMode, ctx: egui::Context) {
+    fn select_account(&mut self, mode: AccountMode) {
         self.launch.cancel();
         self.captcha_revision = self.captcha_revision.wrapping_add(1);
         self.credential_request_id = self.credential_request_id.wrapping_add(1);
@@ -232,7 +237,6 @@ impl ZmApp {
                         account_id,
                         password,
                     });
-                    ctx.request_repaint();
                 });
             }
         }
@@ -252,7 +256,7 @@ impl ZmApp {
         self.status = format!("已选择 {}", game.display_name());
     }
 
-    fn begin_login(&mut self, game: GameKind, ctx: egui::Context) {
+    fn begin_login(&mut self, game: GameKind) {
         if self.account.trim().is_empty() || self.password.is_empty() {
             self.status = "请输入账号和密码".into();
             return;
@@ -303,7 +307,6 @@ impl ZmApp {
                     id,
                     event: Box::new(event),
                 });
-                ctx.request_repaint();
             })
             .await;
         }));
@@ -365,6 +368,7 @@ impl ZmApp {
                             }
                             let game = launch.game;
                             self.ui_update_metrics = TimingSamples::default();
+                            self.diagnostics_cache.invalidate();
                             match self.player.start(*launch) {
                                 Ok(()) => {
                                     self.launch.transition(id, LaunchStage::AwaitingHost);
@@ -551,6 +555,7 @@ impl ZmApp {
         if self.player.is_running() {
             self.last_diagnostics = Some(self.diagnostics());
         }
+        self.diagnostics_cache.invalidate();
         self.pending_stop = None;
         self.launch.cancel();
         self.player.stop();
@@ -569,7 +574,7 @@ impl ZmApp {
         }
     }
 
-    fn refresh_captcha(&mut self, ctx: egui::Context) {
+    fn refresh_captcha(&mut self) {
         let Some(image_url) = self.captcha_url.clone() else {
             return;
         };
@@ -590,7 +595,6 @@ impl ZmApp {
                 revision,
                 result,
             });
-            ctx.request_repaint();
         }));
     }
 
@@ -604,6 +608,20 @@ impl ZmApp {
         output.push_str(&self.ui_update_metrics.summary("ui_update_cpu"));
         output.push_str(&self.assets.performance_summary());
         output
+    }
+
+    fn refresh_diagnostics(&mut self, force: bool) {
+        let now = Instant::now();
+        if force
+            || self
+                .diagnostics_cache
+                .needs_refresh(now, self.player.is_running())
+        {
+            let diagnostics = self.diagnostics();
+            // Start the interval after the query, so a slow game getter cannot
+            // turn the next UI update into another immediate diagnostic query.
+            self.diagnostics_cache.replace(diagnostics, Instant::now());
+        }
     }
 }
 
@@ -656,7 +674,7 @@ impl eframe::App for ZmApp {
             )
             .show(ctx, |ui| match self.page {
                 Page::Login => {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.login_ui(ui, ctx));
+                    egui::ScrollArea::vertical().show(ui, |ui| self.login_ui(ui));
                 }
                 Page::Busy => self.busy_ui(ui),
                 Page::Game => self.game_ui(ui, ctx, fullscreen),
@@ -680,9 +698,6 @@ impl eframe::App for ZmApp {
         self.account_picker(ctx);
         self.switch_confirmation(ctx);
         self.diagnostics_window(ctx);
-        if !self.player.is_running() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         self.ui_update_metrics.record(update_started.elapsed());
     }
 

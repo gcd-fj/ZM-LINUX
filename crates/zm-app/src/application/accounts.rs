@@ -1,7 +1,7 @@
 use super::*;
 
 impl ZmApp {
-    pub(super) fn add_managed_account(&mut self, ctx: egui::Context) {
+    pub(super) fn add_managed_account(&mut self) {
         let account_name = self.manager_account.trim().to_owned();
         if account_name.is_empty() || self.manager_password.is_empty() {
             self.status = "请输入新用户的用户名和密码".into();
@@ -49,7 +49,6 @@ impl ZmApp {
                     "凭据操作失败，系统存储状态未更新：{error}"
                 )));
             }
-            ctx.request_repaint();
         });
 
         self.credential_request_id = self.credential_request_id.wrapping_add(1);
@@ -64,7 +63,7 @@ impl ZmApp {
         self.status = "新用户已添加并切换".into();
     }
 
-    pub(super) fn delete_managed_account(&mut self, id: Uuid, ctx: egui::Context) {
+    pub(super) fn delete_managed_account(&mut self, id: Uuid) {
         let Some(index) = self.config.accounts.iter().position(|entry| entry.id == id) else {
             return;
         };
@@ -82,7 +81,6 @@ impl ZmApp {
         let reply = self
             .credentials
             .delete(&removed.credential_id, &removed.account);
-        let repaint_ctx = ctx.clone();
         let tx = self.tx.clone();
         self.rt.spawn(async move {
             if let Err(error) = receive_credential(reply).await {
@@ -90,10 +88,9 @@ impl ZmApp {
                     "账号记录已删除，但系统凭据删除失败：{error}"
                 )));
             }
-            repaint_ctx.request_repaint();
         });
         if self.account_mode == AccountMode::Saved(id) {
-            self.select_account(AccountMode::New, ctx);
+            self.select_account(AccountMode::New);
             self.account_picker_open = true;
         }
         self.status = "用户已删除".into();
