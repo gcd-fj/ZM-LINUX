@@ -7256,7 +7256,7 @@ checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zm-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "fontdb",
@@ -7277,7 +7277,7 @@ dependencies = [
 
 [[package]]
 name = "zm-assets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "flate2",
@@ -7297,7 +7297,7 @@ dependencies = [
 
 [[package]]
 name = "zm-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -7313,7 +7313,7 @@ dependencies = [
 
 [[package]]
 name = "zm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -7322,7 +7322,7 @@ dependencies = [
 
 [[package]]
 name = "zm-launcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "tokio",
@@ -7334,7 +7334,7 @@ dependencies = [
 
 [[package]]
 name = "zm-player"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "async-task",
@@ -7358,7 +7358,7 @@ dependencies = [
 
 [[package]]
 name = "zm-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dirs",
