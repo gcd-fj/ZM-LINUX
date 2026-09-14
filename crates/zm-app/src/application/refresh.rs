@@ -26,6 +26,21 @@ impl AppSender {
     }
 }
 
+/// `remaining` already measures time until the player's actual frame deadline.
+/// egui subtracts its predicted frame interval from delayed repaint requests;
+/// add that prediction back so an early wake does not turn into repeated zero
+/// delays before the game frame is due. Input and task wakeups remain immediate.
+pub(super) fn request_game_repaint(context: &egui::Context, remaining: Duration) {
+    let delay = if remaining.is_zero() {
+        Duration::ZERO
+    } else {
+        let prediction = context
+            .input(|input| Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default());
+        remaining.saturating_add(prediction)
+    };
+    context.request_repaint_after(delay);
+}
+
 const DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
@@ -61,9 +76,74 @@ impl DiagnosticsCache {
 mod tests {
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn repaint_context() -> (egui::Context, Arc<Mutex<Vec<Duration>>>) {
+        let context = egui::Context::default();
+        for _ in 0..3 {
+            let _ = context.run(egui::RawInput::default(), |_| {});
+        }
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let captured = delays.clone();
+        context.set_request_repaint_callback(move |request| {
+            captured.lock().unwrap().push(request.delay);
+        });
+        (context, delays)
+    }
+
+    #[test]
+    fn game_deadline_compensates_egui_prediction_without_early_repaint_loops() {
+        let (context, delays) = repaint_context();
+        let remaining = Duration::from_millis(5);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            context.request_repaint_after(remaining);
+        });
+        // Demonstrate the upstream behavior that caused premature game updates.
+        assert_eq!(*delays.lock().unwrap(), [Duration::ZERO]);
+
+        for prediction in [1.0 / 60.0, 1.0 / 240.0, 0.0] {
+            for remaining in [
+                Duration::from_millis(30),
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+                Duration::from_micros(1),
+            ] {
+                delays.lock().unwrap().clear();
+                let _ = context.run(
+                    egui::RawInput {
+                        predicted_dt: prediction,
+                        ..Default::default()
+                    },
+                    |context| request_game_repaint(context, remaining),
+                );
+                assert_eq!(*delays.lock().unwrap(), [remaining]);
+            }
+        }
+    }
+
+    #[test]
+    fn game_deadline_keeps_due_frames_and_input_wakeups_immediate() {
+        let (context, delays) = repaint_context();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            request_game_repaint(context, Duration::ZERO);
+        });
+        assert!(delays.lock().unwrap().contains(&Duration::ZERO));
+
+        for _ in 0..3 {
+            let _ = context.run(egui::RawInput::default(), |_| {});
+        }
+        delays.lock().unwrap().clear();
+        let _ = context.run(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(egui::pos2(5.0, 5.0))],
+                ..Default::default()
+            },
+            |context| request_game_repaint(context, Duration::from_millis(30)),
+        );
+        assert!(delays.lock().unwrap().contains(&Duration::ZERO));
+    }
 
     #[test]
     fn diagnostics_refreshes_at_most_once_per_second_and_freezes_after_stop() {

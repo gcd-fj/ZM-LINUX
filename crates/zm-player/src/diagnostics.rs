@@ -148,6 +148,17 @@ impl ResourceMetrics {
     }
 
     pub(crate) fn summary(&self) -> String {
+        let mut output = self.performance_summary();
+        for entry in self.recent.lock().unwrap().iter() {
+            output.push_str("Resource: ");
+            output.push_str(entry);
+            output.push('\n');
+        }
+        output
+    }
+
+    /// Numeric counters only: safe for optional periodic performance logging.
+    pub(crate) fn performance_summary(&self) -> String {
         let hits = self.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
         let downloads = self.downloads.load(std::sync::atomic::Ordering::Relaxed);
         let failures = self.failures.load(std::sync::atomic::Ordering::Relaxed);
@@ -176,11 +187,6 @@ impl ResourceMetrics {
             "Resource transfer (session): pending_requests={} received_body_bytes={} (cache hits excluded; retries included; not overall game progress)\n",
             loading.pending_requests, loading.received_bytes,
         ));
-        for entry in self.recent.lock().unwrap().iter() {
-            output.push_str("Resource: ");
-            output.push_str(entry);
-            output.push('\n');
-        }
         output
     }
 }
@@ -203,6 +209,22 @@ pub(crate) struct FrameMetrics {
     source_fps: f64,
     game_target_fps: f64,
     started_at: Option<Instant>,
+    session_peaks: [SessionPeak; 6],
+}
+
+#[derive(Debug, Default)]
+struct SessionPeak {
+    elapsed: Duration,
+    at_update_start: Option<Duration>,
+}
+
+impl SessionPeak {
+    fn record(&mut self, elapsed: Duration, at_update_start: Duration) {
+        if self.at_update_start.is_none() || elapsed > self.elapsed {
+            self.elapsed = elapsed;
+            self.at_update_start = Some(at_update_start);
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -234,15 +256,27 @@ impl FrameMetrics {
     }
 
     pub(crate) fn record(&mut self, started_at: Instant, sample: FrameUpdateTimings) {
-        self.started_at.get_or_insert(started_at);
+        let session_start = *self.started_at.get_or_insert(started_at);
+        let at_update_start = started_at.saturating_duration_since(session_start);
+        let task_elapsed = sample.tasks[0]
+            .elapsed
+            .saturating_add(sample.tasks[1].elapsed);
+        for (peak, elapsed) in self.session_peaks.iter_mut().zip([
+            Some(sample.update),
+            Some(sample.input),
+            Some(task_elapsed),
+            sample.player_tick,
+            sample.render_submit,
+            sample.schedule_late,
+        ]) {
+            if let Some(elapsed) = elapsed {
+                peak.record(elapsed, at_update_start);
+            }
+        }
         self.updates = self.updates.saturating_add(1);
         self.update.record(sample.update);
         self.input.record(sample.input);
-        self.task_poll.record(
-            sample.tasks[0]
-                .elapsed
-                .saturating_add(sample.tasks[1].elapsed),
-        );
+        self.task_poll.record(task_elapsed);
         for report in sample.tasks {
             self.task_polls = self.task_polls.saturating_add(report.polls);
             self.peak_queue_depth = self.peak_queue_depth.max(report.peak_queue_depth);
@@ -266,16 +300,21 @@ impl FrameMetrics {
     }
 
     pub(crate) fn summary(&self) -> String {
+        self.summary_at(Instant::now())
+    }
+
+    fn summary_at(&self, now: Instant) -> String {
         let elapsed_secs = self
             .started_at
-            .map(|started| started.elapsed().as_secs_f64().max(0.001))
-            .unwrap_or(1.0);
+            .map(|started| now.saturating_duration_since(started).as_secs_f64())
+            .unwrap_or_default();
+        let rate_denominator = elapsed_secs.max(0.001);
         let mut output = format!(
-            "Frames (session): source_fps={:.2} game_target_fps={:.2} update_hz={:.2} tick_hz={:.2} updates={} ticks={} render_submissions={} (source_fps is the loaded SWF header; game_target_fps may change at runtime; tick_hz is host tick calls, not AVM frame rate)\nLocal tasks (session): polls={} queued_tasks={} peak_queue_depth={} max_single_poll_ms={:.3} (poll budget is cooperative, not a hard limit)\n",
+            "Frames (session): source_fps={:.2} game_target_fps={:.2} update_hz={:.2} tick_hz={:.2} updates={} ticks={} render_submissions={} session_elapsed_s={elapsed_secs:.3} (observed since first host update; source_fps is the loaded SWF header; game_target_fps may change at runtime; tick_hz is host tick calls, not AVM frame rate)\nLocal tasks (session): polls={} queued_tasks={} peak_queue_depth={} max_single_poll_ms={:.3} (poll budget is cooperative, not a hard limit)\n",
             self.source_fps,
             self.game_target_fps,
-            self.updates as f64 / elapsed_secs,
-            self.ticks as f64 / elapsed_secs,
+            self.updates as f64 / rate_denominator,
+            self.ticks as f64 / rate_denominator,
             self.updates,
             self.ticks,
             self.render_submissions,
@@ -284,6 +323,7 @@ impl FrameMetrics {
             self.peak_queue_depth,
             self.max_single_poll.as_secs_f64() * 1_000.0,
         );
+        output.push_str("Timing windows: percentiles and peaks below use each stage's bounded recent samples; session peaks are retained separately for the whole observed session. CPU wall is elapsed host-thread time, not CPU utilization or GPU execution; at_update_start_s identifies the containing host update's start.\n");
         for (label, samples) in [
             ("Player update CPU wall", &self.update),
             ("Player input CPU wall", &self.input),
@@ -296,6 +336,26 @@ impl FrameMetrics {
             ("Player schedule_late", &self.schedule_late),
         ] {
             output.push_str(&samples.summary(label));
+        }
+        for (stage, peak) in [
+            "update_cpu_wall",
+            "input_cpu_wall",
+            "task_poll_cpu_wall",
+            "player_tick_cpu_wall",
+            "render_submit_cpu_wall",
+            "schedule_late",
+        ]
+        .into_iter()
+        .zip(&self.session_peaks)
+        {
+            let at_update_start = peak.at_update_start.map_or_else(
+                || "none".to_owned(),
+                |elapsed| format!("{:.3}", elapsed.as_secs_f64()),
+            );
+            output.push_str(&format!(
+                "Player session peak: stage={stage} peak_ms={:.3} at_update_start_s={at_update_start}\n",
+                peak.elapsed.as_secs_f64() * 1_000.0,
+            ));
         }
         output
     }
@@ -500,6 +560,23 @@ pub(crate) fn redact(value: &str, secrets: &Arc<Mutex<Vec<String>>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_resource_metrics_exclude_paths_and_error_payloads() {
+        let metrics = ResourceMetrics::default();
+        metrics.record_success(
+            "assets/private.swf?token=secret",
+            true,
+            Duration::from_millis(5),
+        );
+        metrics.record_failure("assets/failed.swf", "private response payload");
+        let summary = metrics.performance_summary();
+        assert!(summary.contains("cache_hits=1 downloads=0 failures=1"));
+        assert!(!summary.contains("assets/"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("payload"));
+        assert!(metrics.summary().contains("Resource: "));
+    }
 
     #[test]
     fn resource_activity_tracks_retries_cache_hits_and_cancelled_observers() {
@@ -865,5 +942,87 @@ mod tests {
             assert!(summary.contains("source_fps=24.00"));
             assert!(summary.contains(&format!("game_target_fps={target:.2}")));
         }
+    }
+
+    #[test]
+    fn session_peaks_survive_recent_window_eviction_with_their_update_times() {
+        let start = Instant::now();
+        let mut metrics = FrameMetrics::new(30.0);
+        metrics.record(start, FrameUpdateTimings::default());
+        metrics.record(
+            start + Duration::from_millis(250),
+            FrameUpdateTimings {
+                update: Duration::from_millis(1_600),
+                input: Duration::from_millis(1),
+                tasks: [
+                    TaskPollReport {
+                        elapsed: Duration::from_millis(1_535),
+                        polls: 1,
+                        max_single_poll: Duration::from_millis(1_535),
+                        ..Default::default()
+                    },
+                    TaskPollReport::default(),
+                ],
+                player_tick: Some(Duration::from_millis(60)),
+                render_submit: Some(Duration::from_millis(1)),
+                schedule_late: Some(Duration::from_millis(1_529)),
+                game_target_fps: 30.0,
+            },
+        );
+        for millis in 2_000..3_200 {
+            metrics.record(
+                start + Duration::from_millis(millis),
+                FrameUpdateTimings {
+                    update: Duration::from_millis(1),
+                    input: Duration::from_micros(50),
+                    player_tick: Some(Duration::from_micros(500)),
+                    render_submit: Some(Duration::from_micros(100)),
+                    schedule_late: Some(Duration::from_micros(100)),
+                    game_target_fps: 30.0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let summary = metrics.summary_at(start + Duration::from_secs(4));
+        assert!(summary.contains("session_elapsed_s=4.000"));
+        assert!(summary.contains("update_hz=300.50"));
+        let recent_update = summary
+            .lines()
+            .find(|line| line.starts_with("Player update CPU wall:"))
+            .unwrap();
+        assert!(recent_update.contains("sample_count=1200 total_count=1202"));
+        assert!(recent_update.ends_with("peak_ms=1.000"));
+        for (stage, peak_ms) in [
+            ("update_cpu_wall", "1600.000"),
+            ("input_cpu_wall", "1.000"),
+            ("task_poll_cpu_wall", "1535.000"),
+            ("player_tick_cpu_wall", "60.000"),
+            ("render_submit_cpu_wall", "1.000"),
+            ("schedule_late", "1529.000"),
+        ] {
+            assert!(summary.contains(&format!(
+                "Player session peak: stage={stage} peak_ms={peak_ms} at_update_start_s=0.250"
+            )));
+        }
+    }
+
+    #[test]
+    fn absent_stages_have_no_session_peak_time() {
+        let start = Instant::now();
+        let mut metrics = FrameMetrics::default();
+        let empty = metrics.summary_at(start);
+        assert!(empty.contains("session_elapsed_s=0.000"));
+        assert!(empty.contains("update_hz=0.00 tick_hz=0.00"));
+        metrics.record(start, FrameUpdateTimings::default());
+        let summary = metrics.summary_at(start + Duration::from_secs(2));
+        assert!(summary.contains("session_elapsed_s=2.000"));
+        assert!(summary.contains("stage=update_cpu_wall peak_ms=0.000 at_update_start_s=0.000"));
+        assert!(
+            summary.contains("stage=player_tick_cpu_wall peak_ms=0.000 at_update_start_s=none")
+        );
+        assert!(
+            summary.contains("stage=render_submit_cpu_wall peak_ms=0.000 at_update_start_s=none")
+        );
     }
 }

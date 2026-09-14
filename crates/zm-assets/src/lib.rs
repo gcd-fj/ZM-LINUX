@@ -97,6 +97,8 @@ struct AssetPerformance {
     resource_lock_wait: AssetSamples,
     version_lookup: AssetSamples,
     network_attempt: AssetSamples,
+    network_headers: AssetSamples,
+    network_body: AssetSamples,
     swf_patch: AssetSamples,
     main_write: AssetSamples,
     runtime_write: AssetSamples,
@@ -137,6 +139,14 @@ impl AssetPerformance {
             ("Asset resource lock wait", &self.resource_lock_wait),
             ("Asset version lookup", &self.version_lookup),
             ("Asset network attempt", &self.network_attempt),
+            (
+                "Asset HTTP response headers (connect and wait)",
+                &self.network_headers,
+            ),
+            (
+                "Asset HTTP response body (receive and decompress)",
+                &self.network_body,
+            ),
             ("Asset SWF patch and hashes", &self.swf_patch),
             ("Asset main write worker", &self.main_write),
             ("Asset runtime write worker", &self.runtime_write),
@@ -313,6 +323,7 @@ impl OfficialAssetManager {
             }
             return result;
         }
+        let headers_timing = AssetTiming::new(&self.performance.network_headers);
         let mut request = self.client.get(url);
         if let Some(value) = referer {
             request = request.header("Referer", value);
@@ -323,6 +334,8 @@ impl OfficialAssetManager {
             .map_err(DownloadFailure::from)?
             .error_for_status()
             .map_err(DownloadFailure::from)?;
+        drop(headers_timing);
+        let _body_timing = AssetTiming::new(&self.performance.network_body);
         if let Some((callback, attempt)) = progress {
             let total = response.content_length();
             callback(ResourceProgress {
@@ -1345,6 +1358,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(!downloading.is_finished());
+            assert!(
+                manager
+                    .performance
+                    .network_headers
+                    .summary("headers")
+                    .contains("total_count=1")
+            );
+            assert!(
+                manager
+                    .performance
+                    .network_body
+                    .summary("body")
+                    .contains("total_count=0")
+            );
             let path = manager
                 .runtime_resource_dir(GameKind::Zm4)
                 .await
@@ -1398,6 +1425,13 @@ mod tests {
                 }]
             );
             assert_eq!(tokio::fs::read(path).await.unwrap(), asset.bytes);
+            assert!(
+                manager
+                    .performance
+                    .network_body
+                    .summary("body")
+                    .contains("total_count=1")
+            );
         }
     }
 

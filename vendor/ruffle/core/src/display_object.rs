@@ -1462,7 +1462,10 @@ pub trait TDisplayObject<'gc>:
             }
         }
 
-        if include_own_filters {
+        // An empty clip has INVALID bounds. Growing its sentinel coordinates
+        // would turn it into a valid rectangle millions of pixels away, which
+        // then contaminates its parent's bounds and disables bitmap caching.
+        if include_own_filters && bounds.is_valid() {
             for mut filter in self.filters().iter().cloned() {
                 filter.scale(view_matrix.a, view_matrix.d);
                 bounds = filter.calculate_dest_rect(bounds);
@@ -3289,6 +3292,101 @@ mod bitmap_cache_regression {
     #[derive(Debug)]
     struct TestBitmap;
     impl ruffle_render::bitmap::BitmapHandleImpl for TestBitmap {}
+
+    #[test]
+    fn empty_filtered_child_preserves_parent_render_bounds() {
+        use crate::PlayerBuilder;
+        use crate::display_object::movie_clip::MovieClip;
+        use ruffle_render::shape_utils::DrawCommand;
+        let player = PlayerBuilder::new().build();
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| {
+                for filter in [
+                    Filter::BlurFilter(swf::BlurFilter {
+                        blur_x: swf::Fixed16::from_f64(4.0),
+                        blur_y: swf::Fixed16::from_f64(4.0),
+                        flags: swf::BlurFilterFlags::from_passes(1),
+                    }),
+                    Filter::GlowFilter(swf::GlowFilter {
+                        color: swf::Color::WHITE,
+                        blur_x: swf::Fixed16::from_f64(4.0),
+                        blur_y: swf::Fixed16::from_f64(4.0),
+                        strength: swf::Fixed8::ONE,
+                        flags: swf::GlowFilterFlags::from_passes(1),
+                    }),
+                ] {
+                    let mut parent = MovieClip::new(context.root_swf.clone(), context.gc());
+                    let visible = MovieClip::new(context.root_swf.clone(), context.gc());
+                    let filtered = MovieClip::new(context.root_swf.clone(), context.gc());
+                    {
+                        let mut drawing = visible.drawing_mut();
+                        drawing.draw_command(DrawCommand::MoveTo(Point::new(
+                            Twips::ZERO,
+                            Twips::ZERO,
+                        )));
+                        drawing.draw_command(DrawCommand::LineTo(Point::new(
+                            Twips::from_pixels_i32(40),
+                            Twips::from_pixels_i32(40),
+                        )));
+                    }
+                    filtered.set_filters(vec![filter.clone()].into_boxed_slice());
+                    parent.insert_at_index(context, visible.into(), 0);
+                    parent.insert_at_index(context, filtered.into(), 1);
+                    let matrix =
+                        Matrix::translate(Twips::from_pixels_i32(800), Twips::from_pixels_i32(240));
+                    let view_matrix = Matrix::IDENTITY;
+                    let expected =
+                        visible.render_bounds_with_transform(&matrix, true, &view_matrix, false);
+                    // Visibility alone cannot exclude a visible but empty
+                    // animation frame that still has a blur or glow filter.
+                    assert!(filtered.visible());
+                    for drawing_mask in [false, true] {
+                        assert_eq!(
+                            filtered.render_bounds_with_transform(
+                                &matrix,
+                                true,
+                                &view_matrix,
+                                drawing_mask,
+                            ),
+                            Rectangle::INVALID,
+                        );
+                        assert_eq!(
+                            parent.render_bounds_with_transform(
+                                &matrix,
+                                false,
+                                &view_matrix,
+                                drawing_mask,
+                            ),
+                            expected,
+                        );
+                    }
+
+                    // Once that frame gains geometry, its filter must still
+                    // expand the bounds normally.
+                    {
+                        let mut drawing = filtered.drawing_mut();
+                        drawing.draw_command(DrawCommand::MoveTo(Point::new(
+                            Twips::ZERO,
+                            Twips::ZERO,
+                        )));
+                        drawing.draw_command(DrawCommand::LineTo(Point::new(
+                            Twips::from_pixels_i32(80),
+                            Twips::from_pixels_i32(80),
+                        )));
+                    }
+                    let unfiltered =
+                        filtered.render_bounds_with_transform(&matrix, false, &view_matrix, false);
+                    let expanded = filter.calculate_dest_rect(unfiltered);
+                    assert_ne!(expanded, unfiltered);
+                    assert_eq!(
+                        parent.render_bounds_with_transform(&matrix, false, &view_matrix, false,),
+                        expected.union(&expanded),
+                    );
+                }
+            });
+    }
 
     #[test]
     fn hidden_animation_does_not_move_render_bounds() {

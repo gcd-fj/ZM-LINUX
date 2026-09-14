@@ -31,6 +31,7 @@ const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(90);
 mod accounts;
 mod home;
 mod refresh;
+mod status_bar;
 mod views;
 use refresh::{AppSender, DiagnosticsCache};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,8 @@ pub(crate) struct ZmApp {
     ui_update_metrics: TimingSamples,
     diagnostics_cache: DiagnosticsCache,
     font_scan_metrics: TimingSamples,
+    last_performance_log: Option<Instant>,
+    resource_activity: status_bar::ResourceActivity,
 }
 
 impl ZmApp {
@@ -200,6 +203,8 @@ impl ZmApp {
             ui_update_metrics: TimingSamples::default(),
             diagnostics_cache: DiagnosticsCache::default(),
             font_scan_metrics,
+            last_performance_log: None,
+            resource_activity: status_bar::ResourceActivity::default(),
         };
         app.select_account(initial_mode);
         if let Some(error) = config_error {
@@ -506,7 +511,7 @@ impl ZmApp {
                         .launch
                         .transition(message.session_id, LaunchStage::SessionApplied)
                     {
-                        self.status = "登录会话已注入，游戏继续加载；可在诊断中查看运行状态".into();
+                        self.status = "登录成功 · 游戏资源按需加载".into();
                     }
                 }
                 RuntimeEvent::LogoutRequested | RuntimeEvent::ShowAccountPicker => {
@@ -518,14 +523,9 @@ impl ZmApp {
                 RuntimeEvent::PaymentOpenFailed(error) => {
                     self.status = format!("无法打开默认浏览器：{error}")
                 }
-                RuntimeEvent::ResourceLoaded { .. } => {
+                RuntimeEvent::ResourceLoaded { .. } | RuntimeEvent::InitializationProgress => {
                     if self.launch.stage() != LaunchStage::SessionApplied {
-                        self.status = "正在加载游戏资源…".into();
-                    }
-                }
-                RuntimeEvent::InitializationProgress => {
-                    if self.launch.stage() != LaunchStage::SessionApplied {
-                        self.status = "资源已加载，正在初始化游戏数据…".into();
+                        self.status = "正在准备游戏内容…".into();
                     }
                 }
                 RuntimeEvent::ResourceLoadFailed { resource, error } => {
@@ -565,6 +565,9 @@ impl ZmApp {
     }
 
     fn stop_game(&mut self, status: String, open_picker: bool) {
+        self.log_performance(true);
+        self.last_performance_log = None;
+        self.resource_activity = status_bar::ResourceActivity::default();
         if self.player.is_running() {
             self.last_diagnostics = Some(self.diagnostics());
         }
@@ -628,6 +631,27 @@ impl ZmApp {
         output
     }
 
+    fn log_performance(&mut self, force: bool) {
+        if !self.player.is_running() || !tracing::enabled!(target: "zm_perf", tracing::Level::INFO)
+        {
+            return;
+        }
+        if force
+            || self
+                .last_performance_log
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+        {
+            tracing::info!(
+                target: "zm_perf",
+                player = %self.player.performance_summary(),
+                ui = %self.ui_update_metrics.summary("ui_update_cpu"),
+                assets = %self.assets.performance_summary(),
+                "Performance sample (CPU wall time, not GPU execution)"
+            );
+            self.last_performance_log = Some(Instant::now());
+        }
+    }
+
     fn refresh_diagnostics(&mut self, force: bool) {
         let now = Instant::now();
         if force
@@ -659,40 +683,19 @@ impl eframe::App for ZmApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
 
+        let resource_activity = self
+            .resource_activity
+            .update(Instant::now(), self.player.resource_loading_progress());
         if !(self.page == Page::Game && fullscreen) {
             egui::TopBottomPanel::bottom("status-bar")
+                .exact_height(36.0)
                 .frame(
                     egui::Frame::new()
                         .fill(palette::DEEP_INK)
-                        .inner_margin(egui::Margin::symmetric(10, 7)),
+                        .inner_margin(egui::Margin::symmetric(12, 5)),
                 )
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        let row_height = ui.spacing().interact_size.y;
-                        ui.set_min_height(row_height);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
-                            if let Some(progress) = self.player.resource_loading_progress() {
-                                ui.label(format!(
-                                    "资源 {} 项待完成 · 已接收 {:.1} MiB",
-                                    progress.pending_requests,
-                                    progress.received_bytes as f64 / (1024.0 * 1024.0),
-                                ));
-                                ui.spinner();
-                            }
-                            // Keep errors and other notices visible while resources
-                            // are pending, without changing the game viewport height.
-                            ui.add_sized(
-                                [ui.available_width(), row_height],
-                                egui::Label::new(
-                                    egui::RichText::new(&self.status).color(palette::MUTED),
-                                )
-                                .truncate()
-                                .halign(egui::Align::Min),
-                            )
-                            .on_hover_text(&self.status);
-                        });
-                    });
+                    status_bar::show(ui, &self.status, resource_activity);
                 });
         }
 
@@ -737,9 +740,11 @@ impl eframe::App for ZmApp {
         self.switch_confirmation(ctx);
         self.diagnostics_window(ctx);
         self.ui_update_metrics.record(update_started.elapsed());
+        self.log_performance(false);
     }
 
     fn on_exit(&mut self) {
+        self.log_performance(true);
         self.launch.cancel();
         self.player.stop();
         let _ = self.save_config();

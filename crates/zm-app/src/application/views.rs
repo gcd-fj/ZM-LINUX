@@ -121,7 +121,7 @@ impl ZmApp {
                 && !self.account_picker_open
                 && ctx.memory(|memory| memory.focused().is_none_or(|id| id == response.id)),
         });
-        ctx.request_repaint_after(next_frame);
+        refresh::request_game_repaint(ctx, next_frame);
     }
 
     pub(super) fn settings_ui(&mut self, ui: &mut egui::Ui) {

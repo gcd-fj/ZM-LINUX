@@ -136,6 +136,7 @@ impl<N: NavigatorBackend> NavigatorBackend for ZmNavigator<N> {
             let metrics = self.metrics.clone();
             let game = self.game;
             return Box::pin(async move {
+                crate::task_diagnostics::mark_static_resource(&resource);
                 let started = Instant::now();
                 let activity = metrics.begin_load();
                 match assets
@@ -152,6 +153,8 @@ impl<N: NavigatorBackend> NavigatorBackend for ZmNavigator<N> {
                             game = game.slug(),
                             resource,
                             cache_hit = asset.cache_hit,
+                            bytes = asset.bytes.len(),
+                            ready_wait_ms = started.elapsed().as_secs_f64() * 1000.0,
                             "运行时资源已就绪"
                         );
                         Ok(Box::new(RuntimeAssetResponse::new(url, asset.bytes))
@@ -178,7 +181,12 @@ impl<N: NavigatorBackend> NavigatorBackend for ZmNavigator<N> {
                 }
             });
         }
-        self.inner.fetch(request)
+        let authentication = is_game_auth_url(request.url());
+        let response = self.inner.fetch(request);
+        Box::pin(async move {
+            crate::task_diagnostics::mark_network(authentication);
+            response.await
+        })
     }
 
     fn resolve_url(&self, url: &str) -> std::result::Result<Url, url::ParseError> {

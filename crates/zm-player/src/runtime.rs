@@ -8,6 +8,7 @@ use crate::{
         NavigatorSession, RestrictedNavigatorInterface, ZmNavigator, open_official_web_url,
         resource_root,
     },
+    task_diagnostics::TaskDiagnostics,
     ui_backend::ZmUiBackend,
 };
 use egui::{Rect, TextureId};
@@ -104,24 +105,24 @@ fn should_submit_render(frame_due: bool, needs_render: bool) -> bool {
     frame_due && needs_render
 }
 
-fn advance_frame_deadline(previous: Instant, completed_at: Instant, interval: Duration) -> Instant {
+fn advance_frame_deadline(previous: Instant, tick_started: Instant, interval: Duration) -> Instant {
     let interval_nanos = interval.as_nanos();
     if interval_nanos == 0 {
-        return completed_at;
+        return tick_started;
     }
-    let intervals = completed_at
+    let intervals = tick_started
         .saturating_duration_since(previous)
         .as_nanos()
         .checked_div(interval_nanos)
         .unwrap_or(0)
         .saturating_add(1);
     if intervals > u32::MAX as u128 {
-        return completed_at.checked_add(interval).unwrap_or(completed_at);
+        return tick_started.checked_add(interval).unwrap_or(tick_started);
     }
     previous
         .checked_add(interval.saturating_mul(intervals as u32))
-        .or_else(|| completed_at.checked_add(interval))
-        .unwrap_or(completed_at)
+        .or_else(|| tick_started.checked_add(interval))
+        .unwrap_or(tick_started)
 }
 
 fn validate_main_swf_header(bytes: &[u8]) -> Result<()> {
@@ -307,6 +308,7 @@ pub struct GameRuntime {
     startup_metrics: StartupMetrics,
     resource_metrics: Arc<ResourceMetrics>,
     compatibility_metrics: Arc<CompatibilityMetrics>,
+    task_diagnostics: Arc<TaskDiagnostics>,
 }
 
 impl GameRuntime {
@@ -337,6 +339,7 @@ impl GameRuntime {
             startup_metrics: StartupMetrics::default(),
             resource_metrics: Arc::new(ResourceMetrics::default()),
             compatibility_metrics: Arc::new(CompatibilityMetrics::default()),
+            task_diagnostics: Arc::new(TaskDiagnostics::default()),
         }
     }
 
@@ -355,6 +358,7 @@ impl GameRuntime {
         self.secrets = Arc::new(Mutex::new(Vec::new()));
         self.resource_metrics = Arc::new(ResourceMetrics::default());
         self.compatibility_metrics = Arc::new(CompatibilityMetrics::default());
+        self.task_diagnostics = Arc::new(TaskDiagnostics::default());
         // The asset manager already read and verified these bytes. Do not reopen
         // the diagnostic path: it may have changed since launch preparation.
         let main_swf = request.main_swf_bytes.as_ref();
@@ -416,6 +420,7 @@ impl GameRuntime {
             tasks: tasks.clone(),
             queue: task_queue.clone(),
             repaint: self.repaint.clone(),
+            diagnostics: self.task_diagnostics.clone(),
         };
         let content = Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
             movie_url.clone(),
@@ -536,6 +541,7 @@ impl GameRuntime {
         let Some(session) = &mut self.session else {
             return Duration::from_millis(100);
         };
+        self.task_diagnostics.start_observing(tick_started);
         let tasks_before = run_local_tasks(&session.task_queue);
         let input_started = Instant::now();
         let mut player = session.player.lock().unwrap();
@@ -582,9 +588,13 @@ impl GameRuntime {
             player.tick(FloatDuration::from_millis(elapsed.as_secs_f64() * 1000.0));
             player_tick_elapsed = Some(player_tick_started.elapsed());
             session.last_tick_at = now;
+            // Skip deadlines already missed before this tick, not deadlines
+            // crossed while executing it. Ruffle has its own bounded catch-up;
+            // waiting another whole slot after a costly tick can otherwise
+            // lock it into two game frames per render at half the target rate.
             session.next_tick_at = advance_frame_deadline(
                 session.next_tick_at,
-                Instant::now(),
+                now,
                 frame_interval(player.frame_rate()),
             );
         }
@@ -664,13 +674,31 @@ impl GameRuntime {
         (progress.pending_requests > 0).then_some(progress)
     }
 
+    /// Performance-only snapshot, without account data, AVM getters or logs.
+    pub fn performance_summary(&self) -> String {
+        let mut output = format!(
+            "Game={}\n",
+            self.session
+                .as_ref()
+                .map_or("none", |session| session.game.slug()),
+        );
+        output.push_str(&self.frame_metrics.summary());
+        output.push_str(&self.resource_metrics.performance_summary());
+        output
+    }
+
     pub fn diagnostics(&self) -> String {
         let mut output = format!(
-            "ZM-LINUX={}\nRuffle revision={}\nRuffle patches=json-number-precision-v1,date-formats-v1,bitmap-cache-origin-v1,timeline-overlay-v2,visible-render-bounds-v1\nMode=embedded\nVolume={:.2}\n",
+            "ZM-LINUX={}\nRuffle revision={}\nRuffle patches=json-number-precision-v1,date-formats-v1,bitmap-cache-origin-v1,timeline-overlay-v2,visible-render-bounds-v1,empty-filter-bounds-v1\nMode=embedded\nVolume={:.2}\n",
             env!("CARGO_PKG_VERSION"),
             RUFFLE_REVISION,
             self.volume
         );
+        output.push_str(if cfg!(debug_assertions) {
+            "Build debug_assertions=true\n"
+        } else {
+            "Build debug_assertions=false\n"
+        });
         let adapter = self.render_state.adapter.get_info();
         output.push_str(&format!(
             "GPU: name={} backend={:?} type={:?}\n",
@@ -706,6 +734,7 @@ impl GameRuntime {
             self.descriptors_created, self.descriptors_reused,
         ));
         output.push_str(&self.startup_metrics.summary());
+        output.push_str(&self.task_diagnostics.summary());
         output.push_str(&self.resource_metrics.summary());
         output.push_str(&self.compatibility_metrics.summary());
         output.push_str("Recent sanitized AVM log:\n");
@@ -731,6 +760,7 @@ struct LocalSpawner {
     tasks: LocalTasks,
     queue: TaskQueue,
     repaint: egui::Context,
+    diagnostics: Arc<TaskDiagnostics>,
 }
 
 impl<E: std::error::Error + 'static> FutureSpawner<E> for LocalSpawner {
@@ -741,6 +771,7 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for LocalSpawner {
             }
         };
         let queue = self.queue.clone();
+        let future = self.diagnostics.instrument(future);
         let repaint = self.repaint.clone();
         let schedule = move |runnable| {
             queue.lock().unwrap().push_back(runnable);
@@ -946,6 +977,76 @@ mod tests {
     }
 
     #[test]
+    fn expensive_tick_does_not_skip_the_next_frame_deadline_again() {
+        let start = Instant::now();
+        let interval = frame_interval(30.0);
+        let completed = start + Duration::from_millis(36);
+        let next = advance_frame_deadline(start, start, interval);
+        assert_eq!(next, start + interval);
+        assert!(next < completed); // The next update can run immediately.
+    }
+
+    #[test]
+    fn bounded_catchup_recovers_render_cadence_after_one_stall() {
+        // Deterministic model of Ruffle's accumulator and two-frame catch-up:
+        // one frame (12ms) + bookkeeping (12ms) + render (2ms) fits 30Hz,
+        // but two frames plus bookkeeping cross the next 33ms deadline.
+        // A single 100ms stall must not lock subsequent renders at 15Hz.
+        fn simulate(use_completion: bool) -> (u32, u32) {
+            let origin = Instant::now();
+            let interval = frame_interval(30.0);
+            let mut now = origin;
+            let mut last_tick = origin;
+            let mut deadline = origin + interval;
+            let mut accumulated = Duration::ZERO;
+            let mut first = true;
+            let (mut rendered, mut executed) = (0, 0);
+            loop {
+                let started = now.max(deadline);
+                if started >= origin + Duration::from_secs(5) {
+                    break;
+                }
+                accumulated += started.duration_since(last_tick);
+                last_tick = started;
+                let frames = (accumulated.as_nanos() / interval.as_nanos()).min(2) as u32;
+                accumulated -= interval * frames;
+                if accumulated >= interval {
+                    accumulated = Duration::ZERO;
+                }
+                let completed = started
+                    + Duration::from_millis(u64::from(frames) * 12 + 12)
+                    + if first {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::ZERO
+                    };
+                first = false;
+                deadline = advance_frame_deadline(
+                    deadline,
+                    if use_completion { completed } else { started },
+                    interval,
+                );
+                now = completed
+                    + if frames > 0 {
+                        Duration::from_millis(2)
+                    } else {
+                        Duration::ZERO
+                    };
+                if started >= origin + Duration::from_secs(1) {
+                    executed += frames;
+                    rendered += u32::from(frames > 0);
+                }
+            }
+            (rendered, executed)
+        }
+        let (old_renders, old_frames) = simulate(true);
+        let (renders, frames) = simulate(false);
+        assert!((58..=62).contains(&old_renders));
+        assert!((118..=122).contains(&renders));
+        assert!(old_frames.abs_diff(frames) <= 2);
+    }
+
+    #[test]
     fn records_vip_claim_without_faking_the_red_point_state() {
         let metrics = CompatibilityMetrics::default();
         metrics.record("scene.vipHandler.getDailyReward");
@@ -995,6 +1096,7 @@ mod tests {
             queue: queue.clone(),
             tasks: tasks.clone(),
             repaint: egui::Context::default(),
+            diagnostics: Arc::new(TaskDiagnostics::default()),
         };
         let guard = Dropped(dropped.clone());
         let future: OwnedFuture<(), std::io::Error> = Box::pin(async move {
