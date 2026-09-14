@@ -21,3 +21,24 @@ Timeline overlay fix: `movie_clip.rs` preserves surviving sibling anchors when a
 Visible render bounds follow-up: the origin cache key alone did not eliminate chest jitter in real use. Rendering bounds now skip invisible children (including SimpleButton state content), so hidden animation cannot change filter rasterization dimensions or subpixel origins. Mask drawing explicitly preserves invisible descendants. ActionScript-visible getBounds semantics remain untouched. The regression moves a hidden child through fractional-pixel positions and asserts stable render bounds, then verifies mask mode and visible content still include it. Diagnostic marker: visible-render-bounds-v1.
 
 Timeline overlay v2: only move a recreated background when it is above its surviving anchor. Depth insertion may already put it below an authored caption; reinserting at the old anchor index reverses that correct order. The six-frame TimelineLabels fixture exercises both label pages and repeated hover/press/rewind transitions. User confirmed visible-render-bounds-v1 fixes activity chest jitter.
+
+Array.sortOn primitive entries: AVMplus `ArraySort::toFieldObject` / `FieldCompare`
+orders non-object entries together, after objects in ascending sorts and before
+objects in descending sorts, without reading the requested property on primitives.
+The previous implementation read `id` on String entries and threw #1069 while
+the holiday welfare view initialized, leaving reward rows empty. This patch keeps
+real object property/getter errors intact; it does not suppress arbitrary script
+exceptions. The existing shared sort handling of undefined is unchanged.
+Reference: https://github.com/adobe/avmplus/blob/master/core/ArrayClass.cpp#L856-L908
+Regression: `cargo test -p zm-player --test sort_on --locked`; source and SWF are
+in `crates/zm-player/tests/fixtures/ArraySortOn.*`. Rebuild with the same ASC inputs
+as the other fixtures and `python3 tools/build-json-fixture.py ArraySortOn`.
+Diagnostic marker: sort-on-primitives-v1. The synthetic fixture reproduces the
+observed exception; the real-account reward page still requires verification.
+
+Opt-in slow-phase tracing: when the `zm_perf` INFO target is enabled, player
+phases taking at least 25ms log a static phase name and elapsed wall time. This
+separates preload, AVM frames, timers/network callbacks, mouse handling and GC
+without changing their ordering, budgets or outcomes. Phases may nest, so their
+durations must not be summed. Disabled tracing does not read the clock. No script
+values, credentials or account fields are logged. Marker: slow-phase-trace-v1.

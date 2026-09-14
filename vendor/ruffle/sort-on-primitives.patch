@@ -1,0 +1,49 @@
+diff --git a/core/src/avm2/globals/array.rs b/core/src/avm2/globals/array.rs
+index 7b021d3..8387450 100644
+--- a/core/src/avm2/globals/array.rs
++++ b/core/src/avm2/globals/array.rs
+@@ -1211,7 +1211,8 @@ pub fn sort_on<'gc>(
+     let field_names = extract_field_names(activation, field_names_value)?;
+     let mut options = extract_maybe_array_sort_options(activation, args.get_value(1))?;
+ 
+-    let first_option = options.get(0).copied().unwrap_or_else(SortOptions::empty)
++    let global_options = options.first().copied().unwrap_or_else(SortOptions::empty);
++    let first_option = global_options
+         & (SortOptions::UNIQUE_SORT | SortOptions::RETURN_INDEXED_ARRAY);
+     let mut values = if let Some(values) = extract_array_values(activation, this.into())? {
+         values
+@@ -1235,16 +1236,25 @@ pub fn sort_on<'gc>(
+         &mut values,
+         first_option,
+         constrain(|activation, a, b| {
++            // AVMplus ArraySort::FieldCompare does not box primitive entries
++            // and read fields from them. Non-objects compare equal to each
++            // other and follow objects (precede them for descending sorts).
++            // Actual object property/getter errors must still propagate.
++            // https://github.com/adobe/avmplus/blob/master/core/ArrayClass.cpp
++            let (a_object, b_object) = match (a.as_object(), b.as_object()) {
++                (Some(a), Some(b)) => (a, b),
++                (a, b) => {
++                    let order = b.is_some().cmp(&a.is_some());
++                    return Ok(if global_options.contains(SortOptions::DESCENDING) {
++                        order.reverse()
++                    } else {
++                        order
++                    });
++                }
++            };
+             for (field_name, options) in field_names.iter().zip(options.iter()) {
+-                // note: these are incorrect: pretty sure
+-                // if the object is null/undefined or does not have the field,
+-                // it's treated as if the field's value was undefined.
+-                // TODO: verify this and fix it
+-                let a_object = a.null_check(activation, None)?;
+-                let a_field = a_object.get_public_property(*field_name, activation)?;
+-
+-                let b_object = b.null_check(activation, None)?;
+-                let b_field = b_object.get_public_property(*field_name, activation)?;
++                let a_field = Value::from(a_object).get_public_property(*field_name, activation)?;
++                let b_field = Value::from(b_object).get_public_property(*field_name, activation)?;
+ 
+                 let ord = if options.contains(SortOptions::NUMERIC) {
+                     compare_numeric_slow(activation, a_field, b_field)?

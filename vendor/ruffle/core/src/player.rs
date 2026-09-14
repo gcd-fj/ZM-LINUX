@@ -79,6 +79,29 @@ use std::time::Duration;
 use tracing::instrument;
 use web_time::Instant;
 
+/// Opt-in wall-clock tracing for long player phases. The target is disabled
+/// during normal play; values and script data are never included in the log.
+/// Phases can nest (for example preload runs actions), so durations must not
+/// be added together or interpreted as GPU execution time.
+#[inline]
+fn measure_slow_phase<T>(phase: &'static str, operation: impl FnOnce() -> T) -> T {
+    let started = tracing::enabled!(target: "zm_perf", tracing::Level::INFO)
+        .then(Instant::now);
+    let result = operation();
+    if let Some(started) = started {
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(25) {
+            tracing::info!(
+                target: "zm_perf",
+                phase,
+                elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                "Slow player phase (CPU wall time; nested phases may overlap)"
+            );
+        }
+    }
+    result
+}
+
 #[cfg(feature = "default_font")]
 pub const FALLBACK_DEVICE_FONT: &[u8] = include_bytes!("../assets/notosans.subset.ttf.gz");
 
@@ -578,13 +601,13 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
-        self.update_sockets();
-        self.update_net_connections();
-        self.update_timers(dt);
+        measure_slow_phase("sockets", || self.update_sockets());
+        measure_slow_phase("net_connections", || self.update_net_connections());
+        measure_slow_phase("timers", || self.update_timers(dt));
         self.update(|context| {
-            StreamManager::tick(context, dt);
+            measure_slow_phase("streams", || StreamManager::tick(context, dt));
         });
-        self.audio.tick();
+        measure_slow_phase("audio_tick", || self.audio.tick());
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -2014,7 +2037,8 @@ impl Player {
             ),
             LoadBehavior::Blocking => (ExecutionLimit::none(), false),
         };
-        let preload_finished = self.preload(&mut execution_limit);
+        let preload_finished =
+            measure_slow_phase("preload", || self.preload(&mut execution_limit));
 
         if !preload_finished && !may_execute_while_streaming {
             return;
@@ -2022,16 +2046,18 @@ impl Player {
 
         self.update(|context| {
             // TODO: Is this order correct?
-            run_all_phases_avm2(context);
-            Avm1::run_frame(context);
-            AudioManager::update_sounds(context);
-            LocalConnections::update_connections(context);
+            measure_slow_phase("avm2_frame", || run_all_phases_avm2(context));
+            measure_slow_phase("avm1_frame", || Avm1::run_frame(context));
+            measure_slow_phase("frame_audio", || AudioManager::update_sounds(context));
+            measure_slow_phase("local_connections", || LocalConnections::update_connections(context));
 
             // Only run the current list of callbacks - any callbacks added during callback execution
             // will be run at the end of the *next* frame.
-            for cb in std::mem::take(context.post_frame_callbacks) {
-                (cb.callback)(context, cb.data);
-            }
+            measure_slow_phase("frame_callbacks", || {
+                for cb in std::mem::take(context.post_frame_callbacks) {
+                    (cb.callback)(context, cb.data);
+                }
+            });
         });
 
         self.needs_render = true;
@@ -2374,19 +2400,21 @@ impl Player {
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
 
-            Self::run_actions(context);
+            measure_slow_phase("queued_actions", || Self::run_actions(context));
 
             rval
         });
 
         // Update mouse state (check for new hovered button, etc.)
         self.mutate_with_update_context(|context| {
-            Self::update_drag(context);
+            measure_slow_phase("drag", || Self::update_drag(context));
         });
-        self.update_mouse_state(EnumSet::empty(), false, &mut false);
+        measure_slow_phase("mouse", || {
+            self.update_mouse_state(EnumSet::empty(), false, &mut false)
+        });
 
         // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        measure_slow_phase("gc", || self.gc_arena.borrow_mut().collect_debt());
 
         rval
     }

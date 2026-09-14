@@ -689,7 +689,7 @@ impl GameRuntime {
 
     pub fn diagnostics(&self) -> String {
         let mut output = format!(
-            "ZM-LINUX={}\nRuffle revision={}\nRuffle patches=json-number-precision-v1,date-formats-v1,bitmap-cache-origin-v1,timeline-overlay-v2,visible-render-bounds-v1,empty-filter-bounds-v1\nMode=embedded\nVolume={:.2}\n",
+            "ZM-LINUX={}\nRuffle revision={}\nRuffle patches=json-number-precision-v1,date-formats-v1,bitmap-cache-origin-v1,timeline-overlay-v2,visible-render-bounds-v1,empty-filter-bounds-v1,sort-on-primitives-v1,slow-phase-trace-v1\nMode=embedded\nVolume={:.2}\n",
             env!("CARGO_PKG_VERSION"),
             RUFFLE_REVISION,
             self.volume
